@@ -1,1 +1,7 @@
 /target
+/node_modules
+*.db
+*.db-wal
+*.db-shm
+stripe-mock.db
+/scripts/sdk-e2e/node_modules

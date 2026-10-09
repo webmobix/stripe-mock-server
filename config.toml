@@ -1,0 +1,45 @@
+# stripe-mock configuration
+#
+# All fields are documented in README.md and docs/. This sample is committed and
+# is used by the config unit tests, so keep it valid.
+
+[server]
+# Local interface to bind. The internal control plane is only reachable here.
+bind = "127.0.0.1"
+port = 12111
+# Base URL the mock uses when minting onboarding/checkout URLs and redirects.
+public_base_url = "http://127.0.0.1:12111"
+
+[database]
+path = "stripe-mock.db"
+# Clear all state and reseed before serving. Useful in CI.
+reset_on_start = false
+
+[main_account]
+business_type = "company"
+country = "US"
+email = "owner@example.com"
+name = "Mock Platform"
+
+# Event destinations are the single webhook concept, mirroring Stripe's
+# v2.core.event_destination object. Each destination chooses:
+#   event_payload:  "snapshot" (v1 events) or "thin" (v2 events)
+#   events_from:    ["@self"] (your account) and/or ["@accounts"] (connected)
+#   enabled_events: ["*"] or exact names / "prefix.*" patterns
+#   webhook_endpoint.url: the delivery URL
+# To receive both snapshot and thin events, declare two destinations -- exactly
+# like registering a separate endpoint per payload format in Stripe.
+
+[[event_destinations]]
+name = "platform-app"
+event_payload = "snapshot"
+events_from = ["@self", "@accounts"]
+enabled_events = ["*"]
+webhook_endpoint = { url = "http://localhost:4000/stripe/webhook" }
+
+[[event_destinations]]
+name = "thin-app"
+event_payload = "thin"
+events_from = ["@self"]
+enabled_events = ["v2.core.account.*"]
+webhook_endpoint = { url = "http://localhost:4002/stripe/thin" }

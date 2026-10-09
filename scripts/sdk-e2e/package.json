@@ -1,0 +1,9 @@
+{
+  "name": "stripe-mock-sdk-e2e",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Official Stripe Node SDK end-to-end verification against stripe-mock.",
+  "dependencies": {
+    "stripe": "^23.0.0"
+  }
+}
