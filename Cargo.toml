@@ -2,6 +2,8 @@
 name = "stripe-mock"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/webmobix/stripe-mock-server"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

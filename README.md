@@ -317,3 +317,7 @@ server-side time advance / billing renewals, full v2 onboarding
 (`account_tokens` + `persons`), invoices/tax, idempotency keys, concurrent
 per-event delivery, and endpoints beyond the implemented subset. See
 `openspec/changes/build-stripe-mock/design.md` for the deferred list.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). Copyright (c) 2026 Webmobix.
