@@ -24,6 +24,40 @@ curl -s $BASE/internal/accounts/acct_.../secrets
 curl -s $BASE/internal/destinations
 ```
 
+## Seed a connected account
+
+`POST /internal/accounts` seeds a connected (`is_main = false`) account directly,
+without Stripe authentication or the create/onboarding flow, and returns its
+`acct_` id and freshly generated keys. This is a test fixture: no events are
+emitted, so tests that need `account.updated` must use the real create flow.
+
+The body accepts `name` (default `"Mock Business"`), optional `email`, optional
+`country` (default `"US"`), and `state` (`active` or `pending`, default
+`pending`). Each call creates a new account.
+
+```bash
+# Seed an active, fully onboarded account.
+curl -s -X POST $BASE/internal/accounts \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Acme","email":"owner@acme.test","state":"active"}'
+# {"id":"acct_...","object":"account","is_main":false,
+#  "details_submitted":true,"charges_enabled":true,"payouts_enabled":true,
+#  "secret_key":"sk_test_...","publishable_key":"pk_test_..."}
+
+# Seed a pending account awaiting onboarding (state defaults to pending).
+curl -s -X POST $BASE/internal/accounts \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Acme","state":"pending"}'
+# {"id":"acct_...","object":"account","is_main":false,
+#  "details_submitted":false,"charges_enabled":false,"payouts_enabled":false,
+#  "secret_key":"sk_test_...","publishable_key":"pk_test_..."}
+```
+
+An unknown `state` fails with an `invalid_request_error` (`param: "state"`) and
+creates no account. Seeded keys are usable immediately: `/internal/accounts/{id}/secrets`
+returns the same values, `GET /v1/accounts/{id}` reflects the seeded state, and the
+secret key authenticates Stripe API requests.
+
 ## Delivery inspection
 
 ```bash

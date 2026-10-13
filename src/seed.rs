@@ -172,6 +172,66 @@ pub async fn seed_main_account(pool: &SqlitePool, config: &Config) -> Result<Str
     Ok(id)
 }
 
+/// Seed a connected (`is_main = 0`) account from minimal fields and mint its
+/// keys. `active` seeds the fully onboarded state (`details_submitted`,
+/// `charges_enabled`, and `payouts_enabled` true, capabilities `active`);
+/// otherwise the account is seeded `pending`. Returns the new account id.
+pub async fn seed_connected_account(
+    pool: &SqlitePool,
+    name: &str,
+    email: Option<&str>,
+    country: &str,
+    active: bool,
+) -> Result<String, sqlx::Error> {
+    let id = ids::account_id();
+    let now = time::now_epoch();
+    let configuration = json!({
+        "merchant": {
+            "capabilities": {
+                "card_payments": { "requested": true },
+                "transfers": { "requested": true }
+            }
+        }
+    });
+    let status = if active { "active" } else { "pending" };
+    let capabilities = json!({ "card_payments": status, "transfers": status });
+    let requirements = json!({
+        "alternatives": [],
+        "current_deadline": null,
+        "currently_due": [],
+        "disabled_reason": null,
+        "eventually_due": [],
+        "past_due": [],
+        "pending_verification": [],
+    });
+    let identity = json!({
+        "business_details": { "name": name },
+    });
+    let defaults = json!({ "currency": "usd" });
+    let flag = if active { 1 } else { 0 };
+
+    sqlx::query(
+        "INSERT INTO accounts (id, created, updated, livemode, is_main, business_type, email, country, default_currency,
+            identity, configuration, capabilities, requirements, defaults, details_submitted, charges_enabled, payouts_enabled, metadata)
+         VALUES (?1, ?2, ?2, 0, 0, 'company', ?3, ?4, 'usd', ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10, '{}')",
+    )
+    .bind(&id)
+    .bind(now)
+    .bind(email)
+    .bind(country)
+    .bind(identity.to_string())
+    .bind(configuration.to_string())
+    .bind(capabilities.to_string())
+    .bind(requirements.to_string())
+    .bind(defaults.to_string())
+    .bind(flag)
+    .execute(pool)
+    .await?;
+
+    ensure_keys(pool, &id).await?;
+    Ok(id)
+}
+
 /// Ensure both a secret and a publishable key exist for the account.
 pub async fn ensure_keys(pool: &SqlitePool, account_id: &str) -> Result<(), sqlx::Error> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE account_id = ?1")
@@ -258,4 +318,74 @@ pub async fn seed_event_destinations(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use crate::models::AccountRow;
+
+    async fn key_count(pool: &SqlitePool, account_id: &str, kind: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE account_id = ?1 AND kind = ?2")
+            .bind(account_id)
+            .bind(kind)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn seeds_active_connected_account_with_keys() {
+        let pool = db::connect_in_memory().await.unwrap();
+        db::migrate(&pool).await.unwrap();
+
+        let id = seed_connected_account(&pool, "Acme", Some("a@example.com"), "US", true)
+            .await
+            .unwrap();
+
+        let row: AccountRow = sqlx::query_as("SELECT * FROM accounts WHERE id = ?1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.is_main, 0);
+        assert_eq!(row.business_type.as_deref(), Some("company"));
+        assert_eq!(row.email.as_deref(), Some("a@example.com"));
+        assert_eq!(row.country.as_deref(), Some("US"));
+        assert_eq!(row.details_submitted, 1);
+        assert_eq!(row.charges_enabled, 1);
+        assert_eq!(row.payouts_enabled, 1);
+        assert_eq!(
+            row.capabilities(),
+            json!({ "card_payments": "active", "transfers": "active" })
+        );
+        assert_eq!(key_count(&pool, &id, "secret").await, 1);
+        assert_eq!(key_count(&pool, &id, "publishable").await, 1);
+    }
+
+    #[tokio::test]
+    async fn seeds_pending_connected_account() {
+        let pool = db::connect_in_memory().await.unwrap();
+        db::migrate(&pool).await.unwrap();
+
+        let id = seed_connected_account(&pool, "Acme", None, "US", false)
+            .await
+            .unwrap();
+
+        let row: AccountRow = sqlx::query_as("SELECT * FROM accounts WHERE id = ?1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.details_submitted, 0);
+        assert_eq!(row.charges_enabled, 0);
+        assert_eq!(row.payouts_enabled, 0);
+        assert_eq!(
+            row.capabilities(),
+            json!({ "card_payments": "pending", "transfers": "pending" })
+        );
+        assert_eq!(key_count(&pool, &id, "secret").await, 1);
+        assert_eq!(key_count(&pool, &id, "publishable").await, 1);
+    }
 }

@@ -185,7 +185,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/mock/checkout/{id}/cancel", get(mock::checkout_cancel))
         // Internal control plane
         .route("/internal/main", get(internal::main_account))
-        .route("/internal/accounts", get(internal::list_accounts))
+        .route(
+            "/internal/accounts",
+            get(internal::list_accounts).post(internal::create_account),
+        )
         .route(
             "/internal/accounts/{id}/secrets",
             get(internal::account_secrets),

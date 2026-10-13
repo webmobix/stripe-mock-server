@@ -63,6 +63,59 @@ pub async fn list_accounts(State(st): State<AppState>) -> Result<Response, ApiEr
     Ok(ok(json!({ "object": "list", "data": data })))
 }
 
+/// `POST /internal/accounts`: seed a connected account without Stripe auth.
+/// Accepts `name`, optional `email`/`country`, and `state` (`active`/`pending`),
+/// and returns the new account's `acct_` id plus freshly minted keys.
+pub async fn create_account(
+    State(st): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Response, ApiError> {
+    let state = body
+        .get("state")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("pending");
+    let active = match state {
+        "active" => true,
+        "pending" => false,
+        other => {
+            return Err(ApiError::invalid_param(
+                crate::error::ApiVersion::V1,
+                "state",
+                format!("Invalid state: {other}. Expected 'active' or 'pending'."),
+            ));
+        }
+    };
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Mock Business");
+    let email = body
+        .get("email")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let country = body
+        .get("country")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("US");
+
+    let id = seed::seed_connected_account(&st.pool, name, email, country, active)
+        .await
+        .map_err(ApiError::internal)?;
+    let account: AccountRow = sqlx::query_as("SELECT * FROM accounts WHERE id = ?1")
+        .bind(&id)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(ok(account_with_keys(&st.pool, &account).await))
+}
+
 pub async fn account_secrets(
     State(st): State<AppState>,
     Path(id): Path<String>,
