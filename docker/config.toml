@@ -1,0 +1,26 @@
+# Configuration baked into the published container image.
+#
+# Override it by mounting your own file and pointing STRIPE_MOCK_CONFIG at it:
+#   docker run --rm -p 12111:12111 \
+#     -v "$PWD/my-config.toml:/etc/stripe-mock/config.toml:ro" \
+#     webmobix/stripe-mock
+
+[server]
+# Bind every interface so the port is reachable from outside the container.
+bind = "0.0.0.0"
+port = 12111
+# Base URL the mock mints for onboarding/checkout redirects. Change it when the
+# container is published on a different host or port, e.g.
+#   public_base_url = "http://stripe-mock.internal:12111"
+public_base_url = "http://127.0.0.1:12111"
+
+[database]
+# Persisted through the /data volume declared in the Dockerfile.
+path = "/data/stripe-mock.db"
+reset_on_start = false
+
+[main_account]
+business_type = "company"
+country = "US"
+email = "owner@example.com"
+name = "Mock Platform"

@@ -88,6 +88,40 @@ curl -s http://127.0.0.1:12111/internal/main
 # { "id": "acct_...", "secret_key": "sk_test_...", "publishable_key": "pk_test_...", ... }
 ```
 
+## Docker
+
+A runtime image is built from [`Dockerfile`](Dockerfile) and published to
+Docker Hub. Pull and run it:
+
+```bash
+# replace `webmobix` with the namespace configured in CI (see below)
+docker run --rm -p 127.0.0.1:12111:12111 -v stripe-mock-data:/data webmobix/stripe-mock
+curl -s http://127.0.0.1:12111/health
+# {"status":"ok"}
+```
+
+The image runs as a non-root user, binds `0.0.0.0:12111`, and persists SQLite
+state in the `/data` volume. The baked-in configuration lives at
+`/etc/stripe-mock/config.toml`; mount your own file and point
+`STRIPE_MOCK_CONFIG` at it to override it:
+
+```bash
+docker run --rm -p 127.0.0.1:12111:12111 \
+  -v "$PWD/stripe-mock.toml:/etc/stripe-mock/config.toml:ro" \
+  webmobix/stripe-mock
+```
+
+Build and run it locally with:
+
+```bash
+docker build -t stripe-mock .
+docker run --rm -p 127.0.0.1:12111:12111 stripe-mock
+```
+
+> Publishing the port also exposes the unauthenticated `/internal/**` API,
+> which returns account and webhook secret keys. Bind it to `127.0.0.1`
+> (`-p 127.0.0.1:12111:12111`) and never expose it on a public interface.
+
 ## Webhook signing secrets
 
 Use the local-only control plane to access webhook secrets. Every event
@@ -237,6 +271,31 @@ openspec validate unify-event-destinations
 
 The integration tests boot the server on an ephemeral port with a fresh temp
 database and drive it over HTTP, including asynchronous webhook delivery.
+
+## CI and Docker Hub publishing
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on pushes and pull
+requests targeting `main`:
+
+1. **Test** - `cargo test --locked`.
+2. **Build** - `cargo build --release --locked`, with the binary uploaded as a
+   workflow artifact.
+3. **Docker** - builds the runtime image (multi-arch `linux/amd64` /
+   `linux/arm64`) and pushes it to Docker Hub. It only runs for pushes (not
+   pull requests) and `needs` both jobs above, so untested code is never
+   published. On `main` the image is tagged `latest`, `main`, and `sha-<short>`;
+   pushing a `v*.*.*` tag also publishes `X.Y.Z` and `X.Y` tags.
+
+Configure these under **Settings → Secrets and variables → Actions**:
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `DOCKERHUB_USERNAME` | Variable | Docker Hub account (or organization) name. |
+| `DOCKERHUB_TOKEN` | Secret | Docker Hub access token with *Read & Write* scope. |
+
+The workflow pushes to `<DOCKERHUB_USERNAME>/stripe-mock`. Make sure that
+repository exists and is **public** on Docker Hub so anyone can pull it (Docker
+Hub may create it on first push when the token has permission).
 
 ## Documentation
 
