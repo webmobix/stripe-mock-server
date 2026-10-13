@@ -280,8 +280,8 @@ requests targeting `main`:
 1. **Test** - `cargo test --locked`.
 2. **Build** - `cargo build --release --locked`, with the binary uploaded as a
    workflow artifact.
-3. **Docker** - builds the runtime image (multi-arch `linux/amd64` /
-   `linux/arm64`) and pushes it to Docker Hub. It only runs for pushes (not
+3. **Docker** - builds the runtime image (`linux/amd64`) and pushes it to
+   Docker Hub. It only runs for pushes (not
    pull requests) and `needs` both jobs above, so untested code is never
    published. On `main` the image is tagged `latest`, `main`, and `sha-<short>`;
    pushing a `v*.*.*` tag also publishes `X.Y.Z` and `X.Y` tags.
