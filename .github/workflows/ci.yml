@@ -61,7 +61,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.DOCKERHUB_USERNAME }}/stripe-mock
+          images: webmobix/stripe-mock-server
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
