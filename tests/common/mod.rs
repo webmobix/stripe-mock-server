@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,16 +12,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use stripe_mock::config::Config;
-use stripe_mock::{boot, build_router};
+use stripe_mock::{boot_with_listener, build_router};
 use tokio::sync::Mutex;
-
-pub fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 pub struct TestServer {
     pub base_url: String,
@@ -57,7 +48,10 @@ pub async fn spawn() -> TestServer {
 
 /// Boot a fresh server, optionally pointing a snapshot event destination at a receiver.
 pub async fn spawn_with_receiver(receiver_url: Option<String>) -> TestServer {
-    let port = free_port();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
     let db_path = std::env::temp_dir().join(format!(
         "stripe-mock-it-{}.db",
         stripe_mock::ids::random_string(10)
@@ -91,7 +85,7 @@ webhook_endpoint = {{ url = "{target_url}" }}
         db_path.to_string_lossy(),
     );
     let config = Config::from_str(&config_text).unwrap();
-    let (state, listener) = boot(config).await.unwrap();
+    let (state, listener) = boot_with_listener(config, listener).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{addr}");
     let app = build_router(state.clone());
@@ -117,7 +111,10 @@ webhook_endpoint = {{ url = "{target_url}" }}
 /// Boot a fresh server with a single config-declared thin event destination
 /// pointing at the receiver.
 pub async fn spawn_with_thin_destination(receiver_url: String) -> TestServer {
-    let port = free_port();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
     let db_path = std::env::temp_dir().join(format!(
         "stripe-mock-it-{}.db",
         stripe_mock::ids::random_string(10)
@@ -148,7 +145,7 @@ webhook_endpoint = {{ url = "{receiver_url}" }}
         db_path.to_string_lossy(),
     );
     let config = Config::from_str(&config_text).unwrap();
-    let (state, listener) = boot(config).await.unwrap();
+    let (state, listener) = boot_with_listener(config, listener).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{addr}");
     let app = build_router(state.clone());
@@ -268,10 +265,10 @@ pub async fn spawn_receiver() -> WebhookReceiver {
     let app = Router::new()
         .route("/hook", post(hook))
         .with_state(state.clone());
-    let port = free_port();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
+    let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });

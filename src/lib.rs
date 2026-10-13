@@ -216,12 +216,6 @@ pub fn build_router(state: AppState) -> Router {
 pub async fn boot(
     config: Config,
 ) -> Result<(AppState, tokio::net::TcpListener), Box<dyn std::error::Error>> {
-    let pool = db::connect(&config.database.path).await?;
-    db::migrate(&pool).await?;
-    if config.database.reset_on_start {
-        db::reset_state(&pool).await?;
-    }
-    seed::seed(&pool, &config).await?;
     let addr = format!("{}:{}", config.server.bind, config.server.port);
     if !matches!(
         config.server.bind.as_str(),
@@ -233,6 +227,24 @@ pub async fn boot(
         );
     }
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    boot_with_listener(config, listener).await
+}
+
+/// Like [`boot`], but serves on a caller-provided, already-bound listener.
+///
+/// Bind on port `0` to let the OS pick a free port, then call this with a
+/// matching `public_base_url`. Tests use it to avoid the race between probing
+/// for a free port and binding it later.
+pub async fn boot_with_listener(
+    config: Config,
+    listener: tokio::net::TcpListener,
+) -> Result<(AppState, tokio::net::TcpListener), Box<dyn std::error::Error>> {
+    let pool = db::connect(&config.database.path).await?;
+    db::migrate(&pool).await?;
+    if config.database.reset_on_start {
+        db::reset_state(&pool).await?;
+    }
+    seed::seed(&pool, &config).await?;
     let state = AppState::new(pool, config).await?;
     state.dispatcher.start().await?;
     Ok((state, listener))
