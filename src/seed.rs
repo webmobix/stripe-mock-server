@@ -3,15 +3,97 @@ use sqlx::SqlitePool;
 
 use crate::config::Config;
 use crate::ids;
+use crate::mock::STATIC_CHECKOUT_ID;
 use crate::time;
+
+/// Amount (minor units) and currency of the static demo checkout line item.
+const STATIC_CHECKOUT_AMOUNT: i64 = 2000;
+const STATIC_CHECKOUT_CURRENCY: &str = "usd";
 
 /// Seed the main account and the configured event destinations. Idempotent: it
 /// only creates rows that do not exist, re-seeds config-declared destinations by
 /// name, and normalizes webhook secrets so each endpoint URL has exactly one.
 pub async fn seed(pool: &SqlitePool, config: &Config) -> Result<(), sqlx::Error> {
     let main = seed_main_account(pool, config).await?;
+    seed_static_checkout_session(pool, &main, &config.base_url()).await?;
     seed_event_destinations(pool, config, &main).await?;
     normalize_destination_secrets(pool).await?;
+    Ok(())
+}
+
+/// Upsert the well-known static demo checkout session (`cs_test_static`) into a
+/// fresh `open` state owned by `account_id`. Idempotent: re-running leaves
+/// exactly one row, so it serves both boot-time seeding and re-opening the
+/// session after it was completed or expired.
+pub async fn seed_static_checkout_session(
+    pool: &SqlitePool,
+    account_id: &str,
+    base_url: &str,
+) -> Result<(), sqlx::Error> {
+    let now = time::now_epoch();
+    let expires_at = now + 365 * 86_400;
+    let line_items = json!([{
+        "id": "li_static_demo",
+        "object": "item",
+        "amount_total": STATIC_CHECKOUT_AMOUNT,
+        "currency": STATIC_CHECKOUT_CURRENCY,
+        "description": "Static demo item",
+        "price": {
+            "id": "price_static_demo",
+            "object": "price",
+            "active": true,
+            "billing_scheme": "per_unit",
+            "created": now,
+            "currency": STATIC_CHECKOUT_CURRENCY,
+            "livemode": false,
+            "metadata": {},
+            "nickname": null,
+            "product": "prod_static_demo",
+            "recurring": null,
+            "type": "one_time",
+            "unit_amount": STATIC_CHECKOUT_AMOUNT,
+            "unit_amount_decimal": STATIC_CHECKOUT_AMOUNT.to_string(),
+        },
+        "quantity": 1,
+    }]);
+    let url = format!(
+        "{}/mock/checkout/{}",
+        base_url.trim_end_matches('/'),
+        STATIC_CHECKOUT_ID
+    );
+    sqlx::query(
+        "INSERT INTO checkout_sessions (id, account_id, mode, status, created, expires_at,
+            success_url, cancel_url, customer, customer_account, line_items, payment_intent,
+            subscription, amount_total, currency, url, metadata)
+         VALUES (?1, ?2, 'payment', 'open', ?3, ?4, NULL, NULL, NULL, NULL, ?5, NULL, NULL, ?6, ?7, ?8, '{}')
+         ON CONFLICT(id) DO UPDATE SET
+            account_id = excluded.account_id,
+            mode = 'payment',
+            status = 'open',
+            created = excluded.created,
+            expires_at = excluded.expires_at,
+            success_url = NULL,
+            cancel_url = NULL,
+            customer = NULL,
+            customer_account = NULL,
+            line_items = excluded.line_items,
+            payment_intent = NULL,
+            subscription = NULL,
+            amount_total = excluded.amount_total,
+            currency = excluded.currency,
+            url = excluded.url,
+            metadata = '{}'",
+    )
+    .bind(STATIC_CHECKOUT_ID)
+    .bind(account_id)
+    .bind(now)
+    .bind(expires_at)
+    .bind(line_items.to_string())
+    .bind(STATIC_CHECKOUT_AMOUNT)
+    .bind(STATIC_CHECKOUT_CURRENCY)
+    .bind(&url)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

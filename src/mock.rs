@@ -9,6 +9,10 @@ use crate::events;
 use crate::models::{AccountRow, CheckoutSessionRow};
 use crate::time;
 
+/// Well-known checkout session id that is always available so the mock checkout
+/// page can be opened and exercised without creating a session through the API.
+pub const STATIC_CHECKOUT_ID: &str = "cs_test_static";
+
 /// The shared CDN-loaded HTML shell. No client-side framework bundle is used.
 pub fn shell(title: &str, body: &str) -> String {
     format!(
@@ -28,10 +32,8 @@ pub fn shell(title: &str, body: &str) -> String {
         <h1 class="text-2xl font-bold">Stripe Mock</h1>
         <p class="text-sm opacity-70">{title}</p>
       </div>
-      <span class="badge badge-warning">TEST MODE</span>
     </header>
     <main>{body}</main>
-    <footer class="mt-8 text-xs opacity-60">Local simulation tool. Never use in production.</footer>
   </div>
 </body>
 </html>"#
@@ -39,7 +41,10 @@ pub fn shell(title: &str, body: &str) -> String {
 }
 
 /// A shared simulation panel with the controls applicable to each page.
-pub fn simulation_panel(kind: PanelKind) -> String {
+///
+/// `cancel_href` supplies the checkout cancel control target; onboarding passes
+/// `None`.
+pub fn simulation_panel(kind: PanelKind, cancel_href: Option<&str>) -> String {
     let mut controls = String::new();
     match kind {
         PanelKind::Onboarding => {
@@ -62,12 +67,18 @@ pub fn simulation_panel(kind: PanelKind) -> String {
             );
         }
         PanelKind::Checkout => {
-            controls.push_str(
+            let cancel = cancel_href
+                .map(|href| {
+                    format!(r#"<a id="payment-cancel" class="btn" href="{href}">Cancel</a>"#)
+                })
+                .unwrap_or_default();
+            controls.push_str(&format!(
                 r#"<div class="form-control">
-  <label class="label"><span class="label-text">Simulate card payment</span></label>
+  <label class="label"><span class="label-text">Simulate payment</span></label>
   <div class="join">
-    <button class="btn join-item btn-success" name="card" value="success">Successful card</button>
-    <button class="btn join-item btn-error" name="card" value="fail">Declined card</button>
+    <button id="payment-success" class="btn join-item btn-success" name="card" value="success">Successful</button>
+    <button id="payment-decline" class="btn join-item btn-error" name="card" value="fail">Declined</button>
+    {cancel}
   </div>
 </div>
 <div class="form-control">
@@ -76,15 +87,13 @@ pub fn simulation_panel(kind: PanelKind) -> String {
     <option value="card">Card</option>
     <option value="iban">SEPA debit</option>
   </select>
-</div>"#,
-            );
+</div>"#
+            ));
         }
     }
     format!(
         r#"<section class="card bg-base-100 shadow mt-6">
   <div class="card-body">
-    <h2 class="card-title">Simulation panel</h2>
-    <p class="text-sm opacity-70">Controls behave like a developer-mode simulator; no real data is processed.</p>
     {controls}
   </div>
 </section>"#
@@ -162,7 +171,7 @@ pub async fn onboarding_page(State(st): State<AppState>, Path(token): Path<Strin
         account_id = crate::util::html_escape(&account.id),
         token = crate::util::html_escape(&token),
         business_name = "Mock Business",
-        panel = simulation_panel(PanelKind::Onboarding),
+        panel = simulation_panel(PanelKind::Onboarding, None),
     );
     Html(shell("Connected account onboarding", &body)).into_response()
 }
@@ -444,9 +453,16 @@ async fn load_link(pool: &SqlitePool, token: &str) -> Result<Option<LinkRow>, sq
 // ---------------------------------------------------------------------------
 
 pub async fn checkout_page(State(st): State<AppState>, Path(id): Path<String>) -> Response {
-    let session = match load_session(&st.pool, &id).await {
-        Ok(Some(session)) => session,
-        _ => return page_error("This checkout session is invalid."),
+    let session = if id == STATIC_CHECKOUT_ID {
+        match static_session(&st).await {
+            Ok(session) => session,
+            Err(e) => return internal_error(e),
+        }
+    } else {
+        match load_session(&st.pool, &id).await {
+            Ok(Some(session)) => session,
+            _ => return page_error("This checkout session is invalid."),
+        }
     };
     if session.status == "complete" {
         return redirect_success(&session);
@@ -459,6 +475,8 @@ pub async fn checkout_page(State(st): State<AppState>, Path(id): Path<String>) -
         .currency
         .clone()
         .unwrap_or_else(|| "usd".to_string());
+    let escaped_id = crate::util::html_escape(&id);
+    let cancel_href = format!("/mock/checkout/{escaped_id}/cancel");
     let body = format!(
         r#"<div class="card bg-base-100 shadow">
   <div class="card-body">
@@ -474,16 +492,13 @@ pub async fn checkout_page(State(st): State<AppState>, Path(id): Path<String>) -
     <form method="post" action="/mock/checkout/{id}">
       {panel}
     </form>
-    <div class="mt-4">
-      <a class="link link-hover" href="/mock/checkout/{id}/cancel">Cancel and return</a>
-    </div>
   </div>
 </div>"#,
-        id = crate::util::html_escape(&id),
+        id = escaped_id,
         mode = crate::util::html_escape(&session.mode),
         amount = crate::util::html_escape(&format_amount(total, &currency)),
         count = session.line_items().len(),
-        panel = simulation_panel(PanelKind::Checkout),
+        panel = simulation_panel(PanelKind::Checkout, Some(&cancel_href)),
     );
     Html(shell("Checkout", &body)).into_response()
 }
@@ -513,6 +528,25 @@ pub async fn checkout_cancel(State(st): State<AppState>, Path(id): Path<String>)
         Ok(Some(session)) => redirect_cancel(&session),
         _ => page_error("This checkout session is invalid."),
     }
+}
+
+/// Load the static demo session, re-seeding it fresh when it is missing or no
+/// longer open so the well-known URL is always testable.
+async fn static_session(st: &AppState) -> Result<CheckoutSessionRow, sqlx::Error> {
+    if let Some(session) = load_session(&st.pool, STATIC_CHECKOUT_ID).await?
+        && session.status == "open"
+        && session.expires_at >= time::now_epoch()
+    {
+        return Ok(session);
+    }
+    let account_id: String =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE is_main = 1 LIMIT 1")
+            .fetch_one(&st.pool)
+            .await?;
+    crate::seed::seed_static_checkout_session(&st.pool, &account_id, &st.config.base_url()).await?;
+    load_session(&st.pool, STATIC_CHECKOUT_ID)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)
 }
 
 fn redirect_success(session: &CheckoutSessionRow) -> Response {

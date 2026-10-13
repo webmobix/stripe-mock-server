@@ -58,6 +58,15 @@ async fn onboarding_pass_and_fail() {
     assert!(!html.contains("Phone authentication"));
     assert!(!html.contains("react"));
 
+    // Shared developer-tooling chrome and panel framing are gone on all pages.
+    assert!(!html.contains("TEST MODE"));
+    assert!(!html.contains("Local simulation tool. Never use in production."));
+    assert!(!html.contains("Simulation panel"));
+    assert!(!html.contains("developer-mode simulator"));
+    // The onboarding controls remain available.
+    assert!(html.contains("KYC fail"));
+    assert!(html.contains("Payout IBAN"));
+
     // Before onboarding the requested capability reads as pending in the v2 view.
     let pending: Value = server
         .client
@@ -518,7 +527,24 @@ async fn checkout_payment_flow_and_expiry() {
         .unwrap();
     assert!(page.status().is_success());
     let html = page.text().await.unwrap();
-    assert!(html.contains("Successful card"));
+    assert!(html.contains("Successful"));
+    assert!(html.contains("Declined"));
+    assert!(html.contains("Simulate payment"));
+    assert!(html.contains("id=\"payment-success\""));
+    assert!(html.contains("id=\"payment-decline\""));
+    assert!(html.contains("id=\"payment-cancel\""));
+    assert!(!html.contains("Successful card"));
+    assert!(!html.contains("Declined card"));
+
+    // The cancel control navigates to the session's cancel_url.
+    let cancel = server
+        .client
+        .get(server.url(&format!("/mock/checkout/{session_id}/cancel")))
+        .send()
+        .await
+        .unwrap();
+    assert!(cancel.status().is_redirection());
+    assert_eq!(cancel.headers()["location"], "https://example.com/cancel");
 
     // Completing with a successful card redirects to success_url with substitution.
     let response = server
@@ -745,4 +771,122 @@ async fn price_list_filter_and_checkout_modes() {
         .unwrap();
     assert_eq!(setup_done["status"], "complete");
     assert!(setup_done["payment_intent"].is_null());
+}
+
+#[tokio::test]
+async fn static_checkout_session_is_always_available() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+
+    // Seeded at boot with the fixed id and demo content, no session creation needed.
+    let (status, mode, amount_total, line_items): (String, String, i64, String) =
+        sqlx::query_as(
+            "SELECT status, mode, amount_total, line_items FROM checkout_sessions WHERE id = 'cs_test_static'",
+        )
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "open");
+    assert_eq!(mode, "payment");
+    assert_eq!(amount_total, 2000);
+    let line_items: Value = serde_json::from_str(&line_items).unwrap();
+    assert_eq!(line_items.as_array().unwrap().len(), 1);
+    assert_eq!(line_items[0]["description"], "Static demo item");
+
+    // The page renders without creating a session first.
+    let page = server
+        .client
+        .get(server.url("/mock/checkout/cs_test_static"))
+        .send()
+        .await
+        .unwrap();
+    assert!(page.status().is_success());
+    let html = page.text().await.unwrap();
+    assert!(html.contains("20.00"));
+    assert!(html.contains("Successful"));
+    assert!(html.contains("Declined"));
+    assert!(!html.contains("Successful card"));
+    assert!(!html.contains("Declined card"));
+    assert!(html.contains("id=\"payment-success\""));
+    assert!(html.contains("id=\"payment-decline\""));
+    assert!(html.contains("id=\"payment-cancel\""));
+    // Removed tooling chrome and panel framing are absent from the static page.
+    assert!(!html.contains("TEST MODE"));
+    assert!(!html.contains("Local simulation tool. Never use in production."));
+    assert!(!html.contains("Simulation panel"));
+    assert!(!html.contains("developer-mode simulator"));
+
+    // Completing reuses the normal completion flow.
+    let response = server
+        .client
+        .post(server.url("/mock/checkout/cs_test_static"))
+        .form(&[("card", "success")])
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+
+    let session: Value = server
+        .client
+        .get(server.url("/v1/checkout/sessions/cs_test_static"))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["status"], "complete");
+    assert_eq!(session["payment_status"], "paid");
+
+    let pi_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM payment_intents WHERE checkout_session = 'cs_test_static' AND status = 'succeeded'",
+    )
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert!(pi_count >= 1);
+    let completed_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE type = 'checkout.session.completed'")
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert!(completed_events >= 1);
+    let pi_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE type = 'payment_intent.succeeded'")
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert!(pi_events >= 1);
+
+    // Opening the page again re-opens a fresh demo session.
+    let page = server
+        .client
+        .get(server.url("/mock/checkout/cs_test_static"))
+        .send()
+        .await
+        .unwrap();
+    assert!(page.status().is_success());
+    assert!(page.text().await.unwrap().contains("Successful"));
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM checkout_sessions WHERE id = 'cs_test_static'")
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "open");
+
+    // Reset re-seeds it as open.
+    let reset = server
+        .client
+        .post(server.url("/internal/reset"))
+        .send()
+        .await
+        .unwrap();
+    assert!(reset.status().is_success());
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM checkout_sessions WHERE id = 'cs_test_static'")
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "open");
 }
