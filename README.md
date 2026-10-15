@@ -94,8 +94,7 @@ A runtime image is built from [`Dockerfile`](Dockerfile) and published to
 Docker Hub. Pull and run it:
 
 ```bash
-# replace `webmobix` with the namespace configured in CI (see below)
-docker run --rm -p 127.0.0.1:12111:12111 -v stripe-mock-data:/data webmobix/stripe-mock
+docker run --rm -p 127.0.0.1:12111:12111 -v stripe-mock-data:/data webmobix/stripe-mock-server
 curl -s http://127.0.0.1:12111/health
 # {"status":"ok"}
 ```
@@ -108,7 +107,7 @@ state in the `/data` volume. The baked-in configuration lives at
 ```bash
 docker run --rm -p 127.0.0.1:12111:12111 \
   -v "$PWD/stripe-mock.toml:/etc/stripe-mock/config.toml:ro" \
-  webmobix/stripe-mock
+  webmobix/stripe-mock-server
 ```
 
 Build and run it locally with:
@@ -288,10 +287,10 @@ Configure these under **Settings → Secrets and variables → Actions**:
 
 | Name | Kind | Description |
 |------|------|-------------|
-| `DOCKERHUB_USERNAME` | Variable | Docker Hub account (or organization) name. |
+| `DOCKERHUB_USERNAME` | Variable | Docker Hub account used to log in; must have write access to the `webmobix` organization. |
 | `DOCKERHUB_TOKEN` | Secret | Docker Hub access token with *Read & Write* scope. |
 
-The workflow pushes to `<DOCKERHUB_USERNAME>/stripe-mock`. Make sure that
+The workflow pushes to `webmobix/stripe-mock-server`. Make sure that
 repository exists and is **public** on Docker Hub so anyone can pull it (Docker
 Hub may create it on first push when the token has permission).
 
