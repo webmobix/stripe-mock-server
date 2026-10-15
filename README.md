@@ -277,11 +277,13 @@ database and drive it over HTTP, including asynchronous webhook delivery.
 requests targeting `main`:
 
 1. **Test** - `cargo test --locked`.
-2. **Docker** - compiles the release binary inside the image and pushes it to
-   Docker Hub. It only runs for pushes (not pull requests) and `needs` the test
-   job, so untested code is never published. On `main` the image is tagged
-   `latest`, `main`, and `sha-<short>`; pushing a `v*.*.*` tag also publishes
-   `X.Y.Z` and `X.Y` tags.
+2. **Docker** - builds a multi-arch image (`linux/amd64` and `linux/arm64`) on
+   native runners (no QEMU emulation) and pushes it to Docker Hub. Each
+   architecture is built and pushed by digest, then a merge job stitches the
+   digests into one manifest list. It only runs for pushes (not pull requests)
+   and `needs` the test job, so untested code is never published. On `main` the
+   image is tagged `latest`, `main`, and `sha-<short>`; pushing a `v*.*.*` tag
+   also publishes `X.Y.Z` and `X.Y` tags.
 
 Configure these under **Settings → Secrets and variables → Actions**:
 
