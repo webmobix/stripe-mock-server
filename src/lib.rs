@@ -111,8 +111,43 @@ pub fn build_router(state: AppState) -> Router {
             post(api::v1::create_price).get(api::v1::list_prices),
         )
         .route("/v1/prices/{id}", get(api::v1::get_price))
-        .route("/v1/customers", post(api::v1::create_customer))
-        .route("/v1/customers/{id}", get(api::v1::get_customer))
+        .route(
+            "/v1/customers",
+            post(api::v1::create_customer).get(api::v1::list_customers),
+        )
+        .route(
+            "/v1/customers/{id}",
+            get(api::v1::get_customer)
+                .post(api::v1::update_customer)
+                .delete(api::v1::delete_customer),
+        )
+        .route(
+            "/v1/invoices",
+            post(api::invoicing::create_invoice).get(api::invoicing::list_invoices),
+        )
+        .route("/v1/invoices/{id}", get(api::invoicing::get_invoice))
+        .route(
+            "/v1/invoices/{id}/lines",
+            get(api::invoicing::get_invoice_lines),
+        )
+        .route(
+            "/v1/invoices/{id}/finalize",
+            post(api::invoicing::finalize_invoice),
+        )
+        .route("/v1/invoices/{id}/pay", post(api::invoicing::pay_invoice))
+        .route("/v1/invoices/{id}/void", post(api::invoicing::void_invoice))
+        .route(
+            "/v1/invoices/{id}/mark_uncollectible",
+            post(api::invoicing::mark_invoice_uncollectible),
+        )
+        .route(
+            "/v1/payment_intents",
+            post(api::invoicing::create_payment_intent).get(api::invoicing::list_payment_intents),
+        )
+        .route(
+            "/v1/payment_intents/{id}",
+            get(api::invoicing::get_payment_intent),
+        )
         .route(
             "/v1/subscriptions",
             post(api::v1::create_subscription).get(api::v1::list_subscriptions),
@@ -205,6 +240,10 @@ pub fn build_router(state: AppState) -> Router {
             post(internal::flush_deliveries),
         )
         .route("/internal/reset", post(internal::reset))
+        .route(
+            "/internal/payment_intents/{id}/resolve",
+            post(internal::resolve_payment_intent),
+        )
         .layer(axum::middleware::from_fn(guard_internal))
         .layer(axum::middleware::from_fn(log_request))
         .fallback(fallback)

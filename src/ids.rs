@@ -32,6 +32,20 @@ pub fn customer_id() -> String {
     id("cus_")
 }
 
+/// Tax identifier attached to a customer.
+pub fn tax_id() -> String {
+    id("txi_")
+}
+
+pub fn invoice_id() -> String {
+    id("in_")
+}
+
+/// Tax rate materialized from an inline invoice line tax rate.
+pub fn tax_rate_id() -> String {
+    id("txr_")
+}
+
 pub fn subscription_id() -> String {
     id("sub_")
 }
@@ -97,6 +111,9 @@ mod tests {
         assert!(product_id().starts_with("prod_"));
         assert!(price_id().starts_with("price_"));
         assert!(customer_id().starts_with("cus_"));
+        assert!(tax_id().starts_with("txi_"));
+        assert!(invoice_id().starts_with("in_"));
+        assert!(tax_rate_id().starts_with("txr_"));
         assert!(subscription_id().starts_with("sub_"));
         assert!(checkout_session_id().starts_with("cs_test_"));
         assert!(payment_intent_id().starts_with("pi_"));

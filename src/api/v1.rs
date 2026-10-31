@@ -405,6 +405,30 @@ pub async fn list_prices(
 // Billing
 // ---------------------------------------------------------------------------
 
+/// Parse `tax_id_data[]` entries into `tax_id` objects.
+///
+/// An entry needs both a `type` and a `value`; a partial entry is rejected
+/// with the name of the missing field.
+fn parse_tax_id_data(params: &Value, created: i64) -> Result<Vec<Value>, ApiError> {
+    let raw = get_array(params, &["tax_id_data"])
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for entry in &raw {
+        let tax_type = get_str(entry, &["type"])
+            .ok_or_else(|| ApiError::missing_param(v1(), "tax_id_data[][type]"))?;
+        let value = get_str(entry, &["value"])
+            .ok_or_else(|| ApiError::missing_param(v1(), "tax_id_data[][value]"))?;
+        out.push(crate::models::tax_id_entry(
+            &ids::tax_id(),
+            &tax_type,
+            &value,
+            created,
+        ));
+    }
+    Ok(out)
+}
+
 pub async fn create_customer(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -414,16 +438,41 @@ pub async fn create_customer(
     let params = form::parse_form(&body);
     let id = ids::customer_id();
     let now = time::now_epoch();
-    sqlx::query("INSERT INTO customers (id, account_id, email, name, created, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
-        .bind(&id)
-        .bind(&ctx.account_id)
-        .bind(get_str(&params, &["email"]))
-        .bind(get_str(&params, &["name"]))
-        .bind(now)
-        .bind(metadata_from(&params).to_string())
-        .execute(&st.pool)
+    let tax_ids = parse_tax_id_data(&params, now)?;
+
+    let event_id = {
+        let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+        sqlx::query("INSERT INTO customers (id, account_id, email, name, created, tax_ids, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+            .bind(&id)
+            .bind(&ctx.account_id)
+            .bind(get_str(&params, &["email"]))
+            .bind(get_str(&params, &["name"]))
+            .bind(now)
+            .bind(serde_json::to_string(&tax_ids).unwrap_or_else(|_| "[]".to_string()))
+            .bind(metadata_from(&params).to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+        let customer: CustomerRow = sqlx::query_as("SELECT * FROM customers WHERE id = ?1")
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+        let event_id = events::emit(
+            &mut tx,
+            &ctx.account_id,
+            ctx.is_connected,
+            "customer.created",
+            customer.to_json(),
+        )
         .await
         .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
+        event_id
+    };
+    // The state change is already committed; a failed enqueue must not turn it into a 500.
+    let _ = st.dispatcher.dispatch_event(&event_id).await;
+
     let customer: CustomerRow = sqlx::query_as("SELECT * FROM customers WHERE id = ?1")
         .bind(&id)
         .fetch_one(&st.pool)
@@ -450,7 +499,171 @@ pub async fn get_customer(
     Ok(ok(customer.to_json()))
 }
 
-async fn load_price(st: &AppState, account_id: &str, price_id: &str) -> Result<PriceRow, ApiError> {
+pub async fn list_customers(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Result<Response, ApiError> {
+    let ctx = auth(&st, &headers).await?;
+    let params = form::parse_form(query.as_deref().unwrap_or(""));
+    let customers: Vec<CustomerRow> = sqlx::query_as(
+        "SELECT * FROM customers WHERE account_id = ?1 ORDER BY created DESC, rowid DESC",
+    )
+    .bind(&ctx.account_id)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let email = get_str(&params, &["email"]);
+    let customers: Vec<CustomerRow> = customers
+        .into_iter()
+        .filter(|c| match &email {
+            Some(filter) => c.email.as_deref() == Some(filter.as_str()),
+            None => true,
+        })
+        .collect();
+    let (page, has_more) = paginate(
+        customers,
+        get_i64(&params, &["limit"]),
+        get_str(&params, &["starting_after"]),
+        get_str(&params, &["ending_before"]),
+        |c| c.id.clone(),
+    );
+    let data = page.iter().map(|c| c.to_json()).collect();
+    Ok(ok(list_envelope("/v1/customers", data, has_more)))
+}
+
+pub async fn update_customer(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: String,
+) -> Result<Response, ApiError> {
+    let ctx = auth(&st, &headers).await?;
+    let params = form::parse_form(&body);
+    let existing: Option<CustomerRow> =
+        sqlx::query_as("SELECT * FROM customers WHERE id = ?1 AND account_id = ?2")
+            .bind(&id)
+            .bind(&ctx.account_id)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let existing =
+        existing.ok_or_else(|| ApiError::not_found(v1(), format!("No such customer: {id}")))?;
+
+    let now = time::now_epoch();
+    // Only the fields the request supplied are changed.
+    let email = params
+        .get("email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or(existing.email.clone());
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or(existing.name.clone());
+    let metadata = match params.get("metadata") {
+        Some(_) => metadata_from(&params).to_string(),
+        None => existing
+            .metadata
+            .clone()
+            .unwrap_or_else(|| "{}".to_string()),
+    };
+    // A tax id update appends to the existing entries.
+    let mut tax_ids = existing.tax_id_list();
+    tax_ids.extend(parse_tax_id_data(&params, now)?);
+
+    let event_id = {
+        let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+        sqlx::query(
+            "UPDATE customers SET email = ?1, name = ?2, metadata = ?3, tax_ids = ?4 WHERE id = ?5",
+        )
+        .bind(&email)
+        .bind(&name)
+        .bind(&metadata)
+        .bind(serde_json::to_string(&tax_ids).unwrap_or_else(|_| "[]".to_string()))
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+        let customer: CustomerRow = sqlx::query_as("SELECT * FROM customers WHERE id = ?1")
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+        let event_id = events::emit(
+            &mut tx,
+            &ctx.account_id,
+            ctx.is_connected,
+            "customer.updated",
+            customer.to_json(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
+        event_id
+    };
+    let _ = st.dispatcher.dispatch_event(&event_id).await;
+
+    let customer: CustomerRow = sqlx::query_as("SELECT * FROM customers WHERE id = ?1")
+        .bind(&id)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(ok(customer.to_json()))
+}
+
+pub async fn delete_customer(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let ctx = auth(&st, &headers).await?;
+    let existing: Option<CustomerRow> =
+        sqlx::query_as("SELECT * FROM customers WHERE id = ?1 AND account_id = ?2")
+            .bind(&id)
+            .bind(&ctx.account_id)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let existing =
+        existing.ok_or_else(|| ApiError::not_found(v1(), format!("No such customer: {id}")))?;
+
+    let event_id = {
+        let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+        sqlx::query("DELETE FROM customers WHERE id = ?1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+        let event_id = events::emit(
+            &mut tx,
+            &ctx.account_id,
+            ctx.is_connected,
+            "customer.deleted",
+            existing.to_json(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
+        event_id
+    };
+    let _ = st.dispatcher.dispatch_event(&event_id).await;
+
+    // Stripe returns a deleted tombstone, not the full customer.
+    Ok(ok(json!({
+        "id": existing.id,
+        "object": "customer",
+        "deleted": true,
+    })))
+}
+
+pub(crate) async fn load_price(
+    st: &AppState,
+    account_id: &str,
+    price_id: &str,
+    param: &str,
+) -> Result<PriceRow, ApiError> {
     let price: Option<PriceRow> =
         sqlx::query_as("SELECT * FROM prices WHERE id = ?1 AND account_id = ?2")
             .bind(price_id)
@@ -458,13 +671,7 @@ async fn load_price(st: &AppState, account_id: &str, price_id: &str) -> Result<P
             .fetch_optional(&st.pool)
             .await
             .map_err(ApiError::internal)?;
-    price.ok_or_else(|| {
-        ApiError::invalid_param(
-            v1(),
-            "items[0][price]",
-            format!("No such price: {price_id}"),
-        )
-    })
+    price.ok_or_else(|| ApiError::invalid_param(v1(), param, format!("No such price: {price_id}")))
 }
 
 /// Read an optional `quantity`: absent means 1, anything else must be a positive integer.
@@ -520,7 +727,7 @@ pub async fn create_subscription(
         let price_id = get_str(item, &["price"])
             .ok_or_else(|| ApiError::missing_param(v1(), "items[][price]"))?;
         let quantity = parse_quantity(item)?;
-        let price = load_price(&st, &ctx.account_id, &price_id).await?;
+        let price = load_price(&st, &ctx.account_id, &price_id, "items[0][price]").await?;
         built_items.push(build_subscription_item(&price, quantity));
     }
 
@@ -732,7 +939,7 @@ pub async fn create_checkout_session(
         let price_id = get_str(item, &["price"])
             .ok_or_else(|| ApiError::missing_param(v1(), "line_items[][price]"))?;
         let quantity = parse_quantity(item)?;
-        let price = load_price(&st, &ctx.account_id, &price_id).await?;
+        let price = load_price(&st, &ctx.account_id, &price_id, "items[0][price]").await?;
         amount_total = price
             .unit_amount
             .unwrap_or(0)

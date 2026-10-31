@@ -16,6 +16,46 @@ CID=$(echo "$CUSTOMER" | python3 -c 'import sys,json;print(json.load(sys.stdin)[
 curl -s "$BASE/v1/customers/$CID" -H "Authorization: Bearer $KEY"
 ```
 
+### Tax identification
+
+A customer may carry tax ids. Supply them as `tax_id_data[][type]` and
+`tax_id_data[][value]`; each becomes a `tax_ids` entry with a `txi_` id.
+
+```bash
+curl -s -X POST $BASE/v1/customers \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode 'email=buyer@example.com' \
+  --data-urlencode 'tax_id_data[0][type]=eu_vat' \
+  --data-urlencode 'tax_id_data[0][value]=DE123456789'
+```
+
+A tax id entry with a type but no value is rejected with an
+`invalid_request_error`.
+
+### List, update, and delete
+
+```bash
+# List, optionally filtered by email.
+curl -s "$BASE/v1/customers" -H "Authorization: Bearer $KEY"
+curl -s "$BASE/v1/customers?email=buyer@example.com" -H "Authorization: Bearer $KEY"
+
+# Update. A tax id update appends to the existing entries.
+curl -s -X POST $BASE/v1/customers/$CID \
+  -H "Authorization: Bearer $KEY" \
+  -d 'name=New Name'
+
+# Delete. The customer is no longer readable afterwards.
+curl -s -X DELETE $BASE/v1/customers/$CID -H "Authorization: Bearer $KEY"
+```
+
+### Events
+
+- Create → `customer.created`.
+- Update → `customer.updated`.
+- Delete → `customer.deleted`.
+
+See [`invoicing.md`](invoicing.md) for invoices and payment intents.
+
 ## Subscriptions
 
 Create a price first (see [`catalog.md`](catalog.md)), then:
