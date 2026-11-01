@@ -10,7 +10,7 @@ use crate::AppState;
 use crate::api::ok;
 use crate::db;
 use crate::error::ApiError;
-use crate::models::{AccountRow, DeliveryRow, EventDestinationRow};
+use crate::models::{AccountRow, DeliveryRow, EventDestinationRow, PaymentIntentRow};
 use crate::seed;
 
 async fn account_with_keys(pool: &SqlitePool, account: &AccountRow) -> Value {
@@ -216,4 +216,58 @@ pub async fn reset(State(st): State<AppState>) -> Result<Response, ApiError> {
         .map_err(ApiError::internal)?;
     st.dispatcher.start().await.map_err(ApiError::internal)?;
     Ok(ok(json!({ "status": "ok" })))
+}
+
+/// `POST /internal/payment_intents/{id}/resolve`: settle a payment intent as
+/// `succeeded`, `failed`, or `canceled`. The related invoice is updated by the
+/// same settlement path the public invoice-payment endpoint uses.
+pub async fn resolve_payment_intent(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Response, ApiError> {
+    let status = body
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::missing_param(crate::error::ApiVersion::V1, "status"))?;
+
+    // The payment intent may belong to any account; the settlement uses the
+    // intent's own account so the events are scoped like any other.
+    let intent: Option<PaymentIntentRow> =
+        sqlx::query_as("SELECT * FROM payment_intents WHERE id = ?1")
+            .bind(&id)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let intent = intent.ok_or_else(|| {
+        ApiError::not_found(
+            crate::error::ApiVersion::V1,
+            format!("No such payment intent: {id}"),
+        )
+    })?;
+
+    let is_main: i64 = sqlx::query_scalar("SELECT is_main FROM accounts WHERE id = ?1")
+        .bind(&intent.account_id)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let is_connected = is_main == 0;
+
+    let updated = crate::api::invoicing::resolve_payment_intent(
+        &st,
+        &id,
+        status,
+        &intent.account_id,
+        is_connected,
+    )
+    .await?;
+
+    Ok(ok(json!({
+        "id": updated.id,
+        "object": "payment_intent",
+        "status": updated.status,
+        "invoice": updated.invoice,
+    })))
 }

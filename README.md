@@ -302,6 +302,7 @@ Hub may create it on first push when the token has permission).
 - [`docs/accounts.md`](docs/accounts.md) — v2 accounts, `include`/default-null, v1 projection, account links, onboarding.
 - [`docs/catalog.md`](docs/catalog.md) — products and prices.
 - [`docs/billing.md`](docs/billing.md) — customers and subscriptions.
+- [`docs/invoicing.md`](docs/invoicing.md) — invoices, invoice lifecycle, and payment intents.
 - [`docs/checkout.md`](docs/checkout.md) — checkout sessions and completion.
 - [`docs/hosted-ui.md`](docs/hosted-ui.md) — mock onboarding/checkout pages and headless driving.
 - [`docs/webhooks.md`](docs/webhooks.md) — events, destinations, signing, ordering, retries.
@@ -313,7 +314,8 @@ Hub may create it on first push when the token has permission).
 Non-webhook event destination transports (Amazon EventBridge, Azure Event Grid),
 directly usable connected-account keys,
 server-side time advance / billing renewals, full v2 onboarding
-(`account_tokens` + `persons`), invoices/tax, idempotency keys, concurrent
+(`account_tokens` + `persons`), a hosted invoice page, `/v1/tax_rates`,
+`invoiceitems`, idempotency keys, concurrent
 per-event delivery, and endpoints beyond the implemented subset. See
 `openspec/changes/build-stripe-mock/design.md` for the deferred list.
 

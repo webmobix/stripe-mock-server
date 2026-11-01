@@ -115,6 +115,65 @@ const postForm = (url, params) =>
   await stripe.subscriptions.create({ customer: mainCustomer.id, items: [{ price: mainPrice.id }] });
   console.log('main subscription created');
 
+  // --- customer with tax id -> invoice -> finalize -> pay -----------------
+  const taxCustomer = await stripe.customers.create({
+    email: 'taxed@example.com',
+    tax_id_data: [{ type: 'eu_vat', value: 'DE123456789' }],
+  });
+  if (taxCustomer.tax_ids.length !== 1) throw new Error('customer tax id missing');
+  console.log('customer with tax id', taxCustomer.id, taxCustomer.tax_ids[0].id);
+
+  const invoice = await stripe.invoices.create({
+    customer: taxCustomer.id,
+    lines: [{ price: mainPrice.id, quantity: 2, tax_rate: { percentage: 10, name: 'VAT' } }],
+  });
+  console.log('invoice', invoice.id, invoice.status, invoice.subtotal, invoice.tax_total, invoice.total);
+  if (!invoice.id.startsWith('in_')) throw new Error('bad invoice id');
+  if (invoice.status !== 'draft') throw new Error('invoice not draft');
+  if (invoice.tax_total !== 100) throw new Error('bad tax total');
+  if (invoice.total !== 1100) throw new Error('bad invoice total');
+  if (invoice.customer_tax_ids.length !== 1) throw new Error('invoice missing customer tax ids');
+
+  const finalized = await stripe.invoices.finalizeInvoice(invoice.id);
+  console.log('invoice finalized', finalized.status, finalized.amount_due);
+  if (finalized.status !== 'open') throw new Error('invoice not open');
+
+  const paid = await stripe.invoices.pay(invoice.id);
+  console.log('invoice paid', paid.status, paid.amount_paid, paid.amount_remaining);
+  if (paid.status !== 'paid') throw new Error('invoice not paid');
+  if (paid.amount_remaining !== 0) throw new Error('invoice balance left');
+
+  // --- settle a second invoice through the control plane --------------------
+  const second = await stripe.invoices.create({
+    customer: taxCustomer.id,
+    lines: [{ price: mainPrice.id, quantity: 2 }],
+  });
+  await stripe.invoices.finalizeInvoice(second.id);
+  const intent = await stripe.paymentIntents.create({
+    amount: 500,
+    currency: 'usd',
+    customer: taxCustomer.id,
+    invoice: second.id,
+  });
+  console.log('payment intent', intent.id, intent.status);
+  if (!intent.id.startsWith('pi_')) throw new Error('bad payment intent id');
+
+  const resolved = await (
+    await fetch(`${MOCK}/internal/payment_intents/${intent.id}/resolve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'succeeded' }),
+    })
+  ).json();
+  console.log('payment intent resolved', resolved.status);
+  if (resolved.status !== 'succeeded') throw new Error('payment intent not resolved');
+
+  const settled = await stripe.invoices.retrieve(second.id);
+  console.log('invoice after resolve', settled.status, settled.amount_paid, settled.amount_remaining);
+  if (settled.amount_paid !== 500) throw new Error('invoice not credited');
+  if (settled.amount_remaining !== 500) throw new Error('bad remaining balance');
+  if (settled.status !== 'open') throw new Error('invoice status changed on partial payment');
+
   // --- verify signatures through the SDK for both scopes ------------------
   const destinations = await (await fetch(`${MOCK}/internal/destinations`)).json();
   const secrets = Object.fromEntries(
@@ -130,6 +189,11 @@ const postForm = (url, params) =>
   const platformEvent = platformReceiver.received.find((r) => r.type === 'customer.subscription.created');
   if (!connectedEvent) throw new Error('connected-scope target received no event');
   if (!platformEvent) throw new Error('platform-scope target received no event');
+
+  const invoiceEvent = platformReceiver.received.find((r) => r.type === 'invoice.paid');
+  if (!invoiceEvent) throw new Error('no invoice.paid event received');
+  const invoiceVerified = stripe.webhooks.constructEvent(invoiceEvent.body, invoiceEvent.sig, secrets['platform-app']);
+  console.log('verified invoice webhook', invoiceVerified.id, invoiceVerified.type);
 
   const connectedVerified = stripe.webhooks.constructEvent(connectedEvent.body, connectedEvent.sig, secrets['connected-app']);
   const platformVerified = stripe.webhooks.constructEvent(platformEvent.body, platformEvent.sig, secrets['platform-app']);

@@ -287,6 +287,7 @@ pub struct CustomerRow {
     pub email: Option<String>,
     pub name: Option<String>,
     pub created: i64,
+    pub tax_ids: Option<String>,
     pub metadata: Option<String>,
 }
 
@@ -300,8 +301,29 @@ impl CustomerRow {
             "livemode": false,
             "metadata": parse_json_or_empty(&self.metadata),
             "name": self.name,
+            "tax_ids": parse_json_or_empty(&self.tax_ids),
         })
     }
+
+    /// The stored tax ids, always as a list.
+    pub fn tax_id_list(&self) -> Vec<Value> {
+        match parse_json(&self.tax_ids) {
+            Value::Array(items) => items,
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Build a `tax_id` entry for a customer.
+pub fn tax_id_entry(id: &str, tax_type: &str, value: &str, created: i64) -> Value {
+    json!({
+        "id": id,
+        "object": "tax_id",
+        "created": created,
+        "livemode": false,
+        "type": tax_type,
+        "value": value,
+    })
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -404,6 +426,92 @@ impl CheckoutSessionRow {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+pub struct InvoiceRow {
+    pub id: String,
+    pub account_id: String,
+    pub customer: String,
+    pub status: String,
+    pub currency: String,
+    pub created: i64,
+    pub updated: i64,
+    pub finalized_at: Option<i64>,
+    pub paid_at: Option<i64>,
+    pub voided_at: Option<i64>,
+    pub due_date: Option<i64>,
+    pub amount_due: i64,
+    pub amount_paid: i64,
+    pub amount_remaining: i64,
+    pub subtotal: i64,
+    pub tax_total: i64,
+    pub total: i64,
+    pub lines: String,
+    pub customer_tax_ids: String,
+    pub description: Option<String>,
+    pub metadata: Option<String>,
+}
+
+impl InvoiceRow {
+    /// The invoice's lines as a list of line item objects.
+    pub fn line_list(&self) -> Vec<Value> {
+        parse_json(&Some(self.lines.clone()))
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "object": "invoice",
+            "account_country": "US",
+            "amount_due": self.amount_due,
+            "amount_paid": self.amount_paid,
+            "amount_remaining": self.remaining(),
+            "attempt_count": 0,
+            "attempted": self.attempted(),
+            "auto_advance": false,
+            "collection_method": "send_invoice",
+            "created": self.created,
+            "currency": self.currency,
+            "customer": self.customer,
+            "customer_tax_ids": parse_json(&Some(self.customer_tax_ids.clone()))
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            "description": self.description,
+            "due_date": self.due_date,
+            "finalized_at": self.finalized_at,
+            "hosted_invoice_url": Value::Null,
+            "lines": list_envelope(
+                &format!("/v1/invoices/{}/lines", self.id),
+                self.line_list(),
+                false,
+            ),
+            "livemode": false,
+            "metadata": parse_json_or_empty(&self.metadata),
+            "number": Value::Null,
+            "paid": self.status == "paid",
+            "paid_at": self.paid_at,
+            "status": self.status,
+            "subtotal": self.subtotal,
+            "tax_total": self.tax_total,
+            "total": self.total,
+            "voided_at": self.voided_at,
+        })
+    }
+
+    /// The unpaid balance: `amount_due` minus `amount_paid`, never negative.
+    pub fn remaining(&self) -> i64 {
+        (self.amount_due - self.amount_paid).max(0)
+    }
+
+    /// Whether the invoice has been attempted at least once.
+    fn attempted(&self) -> bool {
+        self.status == "paid" || self.status == "uncollectible"
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PaymentIntentRow {
     pub id: String,
     pub account_id: String,
@@ -411,6 +519,7 @@ pub struct PaymentIntentRow {
     pub currency: Option<String>,
     pub status: String,
     pub customer: Option<String>,
+    pub invoice: Option<String>,
     pub created: i64,
     pub checkout_session: Option<String>,
     pub metadata: Option<String>,
@@ -425,6 +534,7 @@ impl PaymentIntentRow {
             "created": self.created,
             "currency": self.currency,
             "customer": self.customer,
+            "invoice": self.invoice,
             "livemode": false,
             "metadata": parse_json_or_empty(&self.metadata),
             "status": self.status,
@@ -647,5 +757,122 @@ impl EventDestinationRow {
     /// Internal representation including the URL and secret unconditionally.
     pub fn to_internal_json(&self) -> Value {
         self.to_json(true, true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn customer(tax_ids: &str) -> CustomerRow {
+        CustomerRow {
+            id: "cus_1".into(),
+            account_id: "acct_1".into(),
+            email: Some("buyer@example.com".into()),
+            name: Some("Buyer".into()),
+            created: 10,
+            tax_ids: Some(tax_ids.into()),
+            metadata: Some("{}".into()),
+        }
+    }
+
+    #[test]
+    fn customer_renders_tax_ids() {
+        let row = customer(
+            r#"[{"id":"txi_1","object":"tax_id","type":"eu_vat","value":"DE1"},{"id":"txi_2","object":"tax_id","type":"de_vat","value":"DE2"}]"#,
+        );
+        let json = row.to_json();
+        assert_eq!(json["tax_ids"].as_array().unwrap().len(), 2);
+        assert_eq!(json["tax_ids"][0]["id"], "txi_1");
+        assert_eq!(json["tax_ids"][0]["type"], "eu_vat");
+        assert_eq!(json["tax_ids"][1]["value"], "DE2");
+    }
+
+    #[test]
+    fn customer_without_tax_ids_renders_empty_list() {
+        let json = customer("").to_json();
+        assert_eq!(json["tax_ids"], json!({}));
+        assert!(customer("").tax_id_list().is_empty());
+    }
+
+    #[test]
+    fn tax_id_entry_shape() {
+        let entry = tax_id_entry("txi_1", "eu_vat", "DE123", 42);
+        assert_eq!(entry["id"], "txi_1");
+        assert_eq!(entry["object"], "tax_id");
+        assert_eq!(entry["type"], "eu_vat");
+        assert_eq!(entry["value"], "DE123");
+        assert_eq!(entry["created"], 42);
+        assert_eq!(entry["livemode"], false);
+    }
+
+    fn invoice(amount_due: i64, amount_paid: i64, status: &str) -> InvoiceRow {
+        InvoiceRow {
+            id: "in_1".into(),
+            account_id: "acct_1".into(),
+            customer: "cus_1".into(),
+            status: status.into(),
+            currency: "usd".into(),
+            created: 10,
+            updated: 10,
+            finalized_at: Some(11),
+            paid_at: if status == "paid" { Some(12) } else { None },
+            voided_at: None,
+            due_date: Some(20),
+            amount_due,
+            amount_paid,
+            amount_remaining: 0,
+            subtotal: amount_due,
+            tax_total: 0,
+            total: amount_due,
+            lines: r#"[{"id":"il_1","object":"line_item","amount":1000}]"#.into(),
+            customer_tax_ids: "[]".into(),
+            description: None,
+            metadata: Some("{}".into()),
+        }
+    }
+
+    #[test]
+    fn paid_invoice_has_no_remaining_balance() {
+        let json = invoice(1100, 1100, "paid").to_json();
+        assert_eq!(json["amount_remaining"], 0);
+        assert_eq!(json["amount_paid"], 1100);
+        assert_eq!(json["paid"], true);
+        assert_eq!(json["status"], "paid");
+    }
+
+    #[test]
+    fn partially_paid_invoice_keeps_the_balance() {
+        let json = invoice(1100, 400, "open").to_json();
+        assert_eq!(json["amount_remaining"], 700);
+        assert_eq!(json["paid"], false);
+    }
+
+    #[test]
+    fn invoice_renders_lines_as_a_list_envelope() {
+        let json = invoice(1000, 0, "draft").to_json();
+        assert_eq!(json["lines"]["object"], "list");
+        assert_eq!(json["lines"]["data"][0]["id"], "il_1");
+        assert_eq!(json["lines"]["url"], "/v1/invoices/in_1/lines");
+    }
+
+    #[test]
+    fn payment_intent_renders_its_invoice() {
+        let row = PaymentIntentRow {
+            id: "pi_1".into(),
+            account_id: "acct_1".into(),
+            amount: Some(1000),
+            currency: Some("usd".into()),
+            status: "requires_payment_method".into(),
+            customer: Some("cus_1".into()),
+            invoice: Some("in_1".into()),
+            created: 10,
+            checkout_session: None,
+            metadata: Some("{}".into()),
+        };
+        let json = row.to_json();
+        assert_eq!(json["invoice"], "in_1");
+        assert_eq!(json["object"], "payment_intent");
+        assert_eq!(json["amount"], 1000);
     }
 }

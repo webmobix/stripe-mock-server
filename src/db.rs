@@ -77,6 +77,31 @@ CREATE TABLE IF NOT EXISTS customers (
     email TEXT,
     name TEXT,
     created INTEGER NOT NULL,
+    tax_ids TEXT,
+    metadata TEXT
+);
+
+CREATE TABLE IF NOT EXISTS invoices (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    customer TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    currency TEXT NOT NULL DEFAULT 'usd',
+    created INTEGER NOT NULL,
+    updated INTEGER NOT NULL,
+    finalized_at INTEGER,
+    paid_at INTEGER,
+    voided_at INTEGER,
+    due_date INTEGER,
+    amount_due INTEGER NOT NULL DEFAULT 0,
+    amount_paid INTEGER NOT NULL DEFAULT 0,
+    amount_remaining INTEGER NOT NULL DEFAULT 0,
+    subtotal INTEGER NOT NULL DEFAULT 0,
+    tax_total INTEGER NOT NULL DEFAULT 0,
+    total INTEGER NOT NULL DEFAULT 0,
+    lines TEXT NOT NULL DEFAULT '[]',
+    customer_tax_ids TEXT NOT NULL DEFAULT '[]',
+    description TEXT,
     metadata TEXT
 );
 
@@ -121,6 +146,7 @@ CREATE TABLE IF NOT EXISTS payment_intents (
     currency TEXT,
     status TEXT NOT NULL,
     customer TEXT,
+    invoice TEXT,
     created INTEGER NOT NULL,
     checkout_session TEXT,
     metadata TEXT
@@ -186,6 +212,8 @@ CREATE INDEX IF NOT EXISTS idx_events_account ON events(account_id);
 CREATE INDEX IF NOT EXISTS idx_deliveries_event ON deliveries(event_id);
 CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status);
 CREATE INDEX IF NOT EXISTS idx_keys_account ON api_keys(account_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_account ON invoices(account_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer);
 "#;
 
 pub async fn connect(path: &str) -> Result<SqlitePool, sqlx::Error> {
@@ -212,6 +240,13 @@ pub async fn connect_in_memory() -> Result<SqlitePool, sqlx::Error> {
 pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     pool.execute(sqlx::raw_sql(SCHEMA)).await?;
     migrate_legacy_columns(pool).await?;
+    // Indexed after the legacy columns are added: `SCHEMA` runs before that
+    // migration, so a pre-existing `payment_intents` table has no `invoice`
+    // column yet when the index would be created.
+    pool.execute(sqlx::raw_sql(
+        "CREATE INDEX IF NOT EXISTS idx_payment_intents_invoice ON payment_intents(invoice);",
+    ))
+    .await?;
     Ok(())
 }
 
@@ -236,6 +271,9 @@ async fn migrate_legacy_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     ] {
         add_column_if_missing(pool, "events", column, decl).await?;
     }
+    // Columns added for customer tax ids and invoice-linked payment intents.
+    add_column_if_missing(pool, "customers", "tax_ids", "TEXT").await?;
+    add_column_if_missing(pool, "payment_intents", "invoice", "TEXT").await?;
     Ok(())
 }
 
@@ -277,6 +315,7 @@ pub async fn reset_state(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "events",
         "payment_intents",
         "checkout_sessions",
+        "invoices",
         "subscriptions",
         "customers",
         "prices",
@@ -305,6 +344,62 @@ mod tests {
         // Re-running must not error.
         migrate(&pool).await.unwrap();
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_customers_and_payment_intents_gain_new_columns() {
+        let pool = connect_in_memory().await.unwrap();
+        // Simulate tables created before the tax id and invoice columns existed.
+        sqlx::query(
+            "CREATE TABLE customers (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, email TEXT, \
+             name TEXT, created INTEGER NOT NULL, metadata TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE payment_intents (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, \
+             amount INTEGER, currency TEXT, status TEXT NOT NULL, customer TEXT, created INTEGER NOT NULL, \
+             checkout_session TEXT, metadata TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate(&pool).await.unwrap();
+
+        assert!(has_column(&pool, "customers", "tax_ids").await.unwrap());
+        assert!(
+            has_column(&pool, "payment_intents", "invoice")
+                .await
+                .unwrap()
+        );
+        // The new tables exist and are usable.
+        sqlx::query(
+            "INSERT INTO customers (id, account_id, created, tax_ids) VALUES ('cus_1', 'acct_1', 0, '[]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO invoices (id, account_id, customer, status, created, updated) \
+             VALUES ('in_1', 'acct_1', 'cus_1', 'draft', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_is_idempotent_with_new_tables() {
+        let pool = connect_in_memory().await.unwrap();
+        migrate(&pool).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices")
             .fetch_one(&pool)
             .await
             .unwrap();
