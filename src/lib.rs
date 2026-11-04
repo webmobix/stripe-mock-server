@@ -131,6 +131,18 @@ pub fn build_router(state: AppState) -> Router {
             get(api::invoicing::get_invoice_lines),
         )
         .route(
+            "/v1/invoices/{id}/add_lines",
+            post(api::invoicing::add_invoice_lines),
+        )
+        .route(
+            "/v1/invoices/{id}/remove_lines",
+            post(api::invoicing::remove_invoice_lines),
+        )
+        .route(
+            "/v1/invoices/{id}/update_lines",
+            post(api::invoicing::update_invoice_lines),
+        )
+        .route(
             "/v1/invoices/{id}/finalize",
             post(api::invoicing::finalize_invoice),
         )

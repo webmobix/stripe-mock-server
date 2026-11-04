@@ -1134,6 +1134,685 @@ async fn invoice_events_are_delivered() {
 }
 
 // ---------------------------------------------------------------------------
+// Invoice line editing
+// ---------------------------------------------------------------------------
+
+/// Create a one-time price in `currency` and return its id.
+async fn create_price_in_currency(
+    server: &TestServer,
+    key: &str,
+    amount: i64,
+    currency: &str,
+) -> String {
+    let product: Value = server
+        .client
+        .post(server.url("/v1/products"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[("name", "Widget")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let price: Value = server
+        .client
+        .post(server.url("/v1/prices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("product", product["id"].as_str().unwrap()),
+            ("unit_amount", amount.to_string().as_str()),
+            ("currency", currency),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    price["id"].as_str().unwrap().to_string()
+}
+
+/// Post to one of the invoice line endpoints and return the raw response.
+async fn post_lines(
+    server: &TestServer,
+    key: &str,
+    invoice_id: &str,
+    action: &str,
+    form: &[(&str, &str)],
+) -> reqwest::Response {
+    server
+        .client
+        .post(server.url(&format!("/v1/invoices/{invoice_id}/{action}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(form)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Read an invoice back.
+async fn get_invoice(server: &TestServer, key: &str, invoice_id: &str) -> Value {
+    server
+        .client
+        .get(server.url(&format!("/v1/invoices/{invoice_id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_catalog_line_and_an_ad_hoc_line_can_be_added() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+    assert_eq!(invoice["subtotal"], 1000);
+
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[
+            ("lines[0][price]", price.as_str()),
+            ("lines[0][quantity]", "2"),
+            ("lines[1][amount]", "500"),
+            ("lines[1][description]", "Setup fee"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let updated: Value = response.json().await.unwrap();
+
+    let lines = updated["lines"]["data"].as_array().unwrap();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[1]["amount"], 2000);
+    assert_eq!(lines[1]["quantity"], 2);
+    assert_eq!(lines[1]["price"]["id"], price);
+    assert_eq!(lines[2]["amount"], 500);
+    assert_eq!(lines[2]["description"], "Setup fee");
+    assert!(lines[2]["price"].is_null());
+    assert_eq!(lines[2]["currency"], "usd");
+
+    assert_eq!(updated["subtotal"], 3500);
+    assert_eq!(updated["tax_total"], 0);
+    assert_eq!(updated["total"], 3500);
+    assert_eq!(updated["amount_due"], 3500);
+    assert_eq!(updated["amount_remaining"], 3500);
+}
+
+#[tokio::test]
+async fn a_line_with_an_inline_tax_rate_is_added() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[
+            ("lines[0][price]", price.as_str()),
+            ("lines[0][tax_rate][percentage]", "10"),
+            ("lines[0][tax_rate][name]", "VAT"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let updated: Value = response.json().await.unwrap();
+
+    let line = &updated["lines"]["data"][1];
+    let tax_amounts = line["tax_amounts"].as_array().unwrap();
+    assert_eq!(tax_amounts.len(), 1);
+    assert_eq!(tax_amounts[0]["amount"], 100);
+    assert_eq!(tax_amounts[0]["tax_rate"]["percentage"], 10);
+    assert_eq!(updated["tax_total"], 100);
+    assert_eq!(
+        updated["total"],
+        updated["subtotal"].as_i64().unwrap() + 100
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_line_leaves_the_invoice_unchanged() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+    let euro_price = create_price_in_currency(&server, &key, 1000, "eur").await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    // An unknown price.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[("lines[0][price]", "price_missing")],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // A price in another currency.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[("lines[0][price]", euro_price.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // An amount that is not a non-negative integer.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[("lines[0][amount]", "-100")],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // No lines at all.
+    let response = post_lines(&server, &key, &id, "add_lines", &[]).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["param"], "lines");
+
+    // The invoice still holds its original line and totals.
+    let invoice = get_invoice(&server, &key, &id).await;
+    let lines = invoice["lines"]["data"].as_array().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["amount"], 1000);
+    assert_eq!(invoice["subtotal"], 1000);
+    assert_eq!(invoice["total"], 1000);
+}
+
+#[tokio::test]
+async fn lines_cannot_be_added_to_a_non_draft_invoice() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+    server
+        .client
+        .post(server.url(&format!("/v1/invoices/{id}/finalize")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[("lines[0][price]", price.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    let invoice = get_invoice(&server, &key, &id).await;
+    assert_eq!(invoice["status"], "open");
+    assert_eq!(invoice["lines"]["data"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_line_can_be_removed_and_the_totals_follow() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+    let added: Value = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[
+            ("lines[0][price]", price.as_str()),
+            ("lines[0][quantity]", "2"),
+        ],
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let lines = added["lines"]["data"].as_array().unwrap();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(added["total"], 3000);
+    let first_id = lines[0]["id"].as_str().unwrap().to_string();
+
+    // Removing one line.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "remove_lines",
+        &[("lines[0][id]", first_id.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let updated: Value = response.json().await.unwrap();
+    let lines = updated["lines"]["data"].as_array().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["amount"], 2000);
+    assert_eq!(updated["subtotal"], 2000);
+    assert_eq!(updated["total"], 2000);
+    assert_eq!(updated["amount_due"], 2000);
+    assert_eq!(updated["amount_remaining"], 2000);
+
+    // Removing every line.
+    let remaining_id = lines[0]["id"].as_str().unwrap().to_string();
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "remove_lines",
+        &[("lines[0][id]", remaining_id.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let updated: Value = response.json().await.unwrap();
+    assert_eq!(updated["lines"]["data"].as_array().unwrap().len(), 0);
+    assert_eq!(updated["subtotal"], 0);
+    assert_eq!(updated["tax_total"], 0);
+    assert_eq!(updated["total"], 0);
+    assert_eq!(updated["amount_due"], 0);
+    assert_eq!(updated["amount_remaining"], 0);
+}
+
+#[tokio::test]
+async fn removing_a_line_that_is_not_on_the_invoice_is_rejected() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "remove_lines",
+        &[("lines[0][id]", "il_missing")],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // The invoice still holds its line and totals.
+    let invoice = get_invoice(&server, &key, &id).await;
+    assert_eq!(invoice["lines"]["data"].as_array().unwrap().len(), 1);
+    assert_eq!(invoice["total"], 1000);
+}
+
+#[tokio::test]
+async fn an_unknown_line_behavior_is_rejected() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+    let line_id = invoice["lines"]["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "remove_lines",
+        &[
+            ("lines[0][id]", line_id.as_str()),
+            ("lines[0][behavior]", "archive"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // The invoice still holds its line.
+    let invoice = get_invoice(&server, &key, &id).await;
+    assert_eq!(invoice["lines"]["data"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn lines_cannot_be_removed_from_a_non_draft_invoice() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+    let line_id = invoice["lines"]["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server
+        .client
+        .post(server.url(&format!("/v1/invoices/{id}/finalize")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "remove_lines",
+        &[("lines[0][id]", line_id.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    let invoice = get_invoice(&server, &key, &id).await;
+    assert_eq!(invoice["lines"]["data"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_line_quantity_and_tax_rate_can_be_updated() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+    let line_id = invoice["lines"]["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Updating the quantity recomputes the line amount and the invoice total.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "update_lines",
+        &[
+            ("lines[0][id]", line_id.as_str()),
+            ("lines[0][quantity]", "3"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let updated: Value = response.json().await.unwrap();
+    let line = &updated["lines"]["data"][0];
+    assert_eq!(line["quantity"], 3);
+    assert_eq!(line["amount"], 3000);
+    assert_eq!(updated["subtotal"], 3000);
+    assert_eq!(updated["total"], 3000);
+
+    // Updating the tax rate recomputes the line tax and the invoice tax total.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "update_lines",
+        &[
+            ("lines[0][id]", line_id.as_str()),
+            ("lines[0][tax_rate][percentage]", "20"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let updated: Value = response.json().await.unwrap();
+    let line = &updated["lines"]["data"][0];
+    assert_eq!(line["tax_amounts"][0]["amount"], 600);
+    assert_eq!(updated["tax_total"], 600);
+    assert_eq!(updated["total"], 3600);
+
+    // Updating the description leaves the total alone.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "update_lines",
+        &[
+            ("lines[0][id]", line_id.as_str()),
+            ("lines[0][description]", "Revised"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let updated: Value = response.json().await.unwrap();
+    assert_eq!(updated["lines"]["data"][0]["description"], "Revised");
+    assert_eq!(updated["total"], 3600);
+
+    // Updating the amount sets it directly.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "update_lines",
+        &[
+            ("lines[0][id]", line_id.as_str()),
+            ("lines[0][amount]", "250"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let updated: Value = response.json().await.unwrap();
+    assert_eq!(updated["lines"]["data"][0]["amount"], 250);
+    assert_eq!(updated["subtotal"], 250);
+    assert_eq!(updated["tax_total"], 50);
+    assert_eq!(updated["total"], 300);
+}
+
+#[tokio::test]
+async fn updating_a_line_that_is_not_on_the_invoice_is_rejected() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "update_lines",
+        &[("lines[0][id]", "il_missing"), ("lines[0][quantity]", "3")],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // The invoice still holds its original lines and totals.
+    let invoice = get_invoice(&server, &key, &id).await;
+    let lines = invoice["lines"]["data"].as_array().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["amount"], 1000);
+    assert_eq!(invoice["subtotal"], 1000);
+    assert_eq!(invoice["total"], 1000);
+}
+
+#[tokio::test]
+async fn lines_cannot_be_updated_on_a_non_draft_invoice() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+    let line_id = invoice["lines"]["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server
+        .client
+        .post(server.url(&format!("/v1/invoices/{id}/finalize")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "update_lines",
+        &[
+            ("lines[0][id]", line_id.as_str()),
+            ("lines[0][quantity]", "3"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    let invoice = get_invoice(&server, &key, &id).await;
+    assert_eq!(invoice["lines"]["data"][0]["amount"], 1000);
+}
+
+#[tokio::test]
+async fn every_line_change_emits_an_invoice_updated_event() {
+    let receiver = spawn_receiver().await;
+    let server = spawn_with_receiver(Some(receiver.url.clone())).await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    let added: Value = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[("lines[0][amount]", "500")],
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let added_line_id = added["lines"]["data"][1]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    post_lines(
+        &server,
+        &key,
+        &id,
+        "remove_lines",
+        &[("lines[0][id]", added_line_id.as_str())],
+    )
+    .await;
+
+    let line_id = added["lines"]["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    post_lines(
+        &server,
+        &key,
+        &id,
+        "update_lines",
+        &[
+            ("lines[0][id]", line_id.as_str()),
+            ("lines[0][quantity]", "2"),
+        ],
+    )
+    .await;
+
+    flush(&server).await;
+    let state = receiver.state.lock().await;
+    let updates: Vec<&serde_json::Value> = state
+        .received
+        .iter()
+        .map(|d| &d.body)
+        .filter(|body| body["type"] == "invoice.updated")
+        .collect();
+    assert_eq!(updates.len(), 3, "{:?}", received_types(&receiver).await);
+    for body in &updates {
+        assert_eq!(body["data"]["object"]["id"], id);
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_line_change_emits_no_event_and_keeps_the_timestamp() {
+    let receiver = spawn_receiver().await;
+    let server = spawn_with_receiver(Some(receiver.url.clone())).await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 1000).await;
+
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+    let before = get_invoice(&server, &key, &id).await;
+    let updated_before = before["updated"].as_i64().unwrap();
+
+    // A rejected line change.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[("lines[0][price]", "price_missing")],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+
+    let after = get_invoice(&server, &key, &id).await;
+    assert_eq!(after["updated"].as_i64().unwrap(), updated_before);
+    assert_eq!(after["total"], before["total"]);
+
+    flush(&server).await;
+    let types = received_types(&receiver).await;
+    assert!(!types.contains(&"invoice.updated".to_string()), "{types:?}");
+}
+
+// ---------------------------------------------------------------------------
 // Reset
 // ---------------------------------------------------------------------------
 

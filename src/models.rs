@@ -496,6 +496,7 @@ impl InvoiceRow {
             "subtotal": self.subtotal,
             "tax_total": self.tax_total,
             "total": self.total,
+            "updated": self.updated,
             "voided_at": self.voided_at,
         })
     }

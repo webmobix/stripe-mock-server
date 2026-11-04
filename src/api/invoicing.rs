@@ -109,21 +109,151 @@ fn percentage_value(percentage: f64) -> Value {
     }
 }
 
-/// Build one invoice line from a price, a quantity, and an optional tax rate.
-///
-/// The tax rate is given inline as `tax_rate[percentage]` (and an optional
-/// `tax_rate[name]`); it is materialized as a `tax_rate` object on the line.
-fn build_invoice_line(
-    price: &PriceRow,
-    quantity: i64,
-    tax_rate: Option<&Value>,
-) -> Result<(Value, i64, i64), ApiError> {
-    let amount = price.unit_amount.unwrap_or(0).saturating_mul(quantity);
-    let mut tax_amounts = Vec::new();
-    let mut tax_rates = Vec::new();
-    let mut tax_total = 0i64;
+// ---------------------------------------------------------------------------
+// Invoice lines
+// ---------------------------------------------------------------------------
 
-    if let Some(rate) = tax_rate {
+/// A line item as it was requested: either priced from the catalog or written
+/// directly.
+#[derive(Debug, Clone)]
+enum LineRequest {
+    /// `price` with an optional `quantity`; the price is resolved from the
+    /// catalog before the line is rendered.
+    Catalog {
+        price_id: String,
+        quantity: i64,
+        price: Option<Box<PriceRow>>,
+    },
+    /// `amount` with an optional `description`.
+    AdHoc {
+        amount: i64,
+        description: Option<String>,
+    },
+}
+
+/// A requested line and the inline tax rate it carries.
+#[derive(Debug, Clone)]
+struct LineItem {
+    request: LineRequest,
+    tax_rate: Option<Value>,
+}
+
+/// The parts of a rendered invoice line.
+#[derive(Debug, Clone)]
+struct LineDraft {
+    amount: i64,
+    currency: String,
+    description: Option<String>,
+    quantity: Option<i64>,
+    price: Option<Value>,
+    tax_rate: Option<Value>,
+}
+
+/// The totals an invoice derives from its lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InvoiceTotals {
+    subtotal: i64,
+    tax_total: i64,
+    total: i64,
+}
+
+/// Parse a line item as either catalog-priced (`price`, optional `quantity`)
+/// or ad-hoc (`amount`, optional `description`).
+fn parse_line_request(item: &Value) -> Result<LineRequest, ApiError> {
+    if let Some(price_id) = get_str(item, &["price"]) {
+        let quantity = parse_quantity(item)?;
+        return Ok(LineRequest::Catalog {
+            price_id,
+            quantity,
+            price: None,
+        });
+    }
+    if item.get("amount").is_none() {
+        return Err(ApiError::invalid_request(
+            v1(),
+            "Each line must have either a `price` or an `amount`",
+        ));
+    }
+    let amount = get_i64(item, &["amount"])
+        .filter(|amount| *amount >= 0)
+        .ok_or_else(|| {
+            ApiError::invalid_param(
+                v1(),
+                "lines[][amount]",
+                "Invalid amount: must be a non-negative integer",
+            )
+        })?;
+    Ok(LineRequest::AdHoc {
+        amount,
+        description: get_str(item, &["description"]),
+    })
+}
+
+/// Parse the `lines` array of a request into line items.
+fn parse_line_items(raw: &[Value]) -> Result<Vec<LineItem>, ApiError> {
+    raw.iter()
+        .map(|item| {
+            Ok(LineItem {
+                request: parse_line_request(item)?,
+                tax_rate: item.get("tax_rate").filter(|rate| !rate.is_null()).cloned(),
+            })
+        })
+        .collect()
+}
+
+/// Build a `tax_rate` object from an inline `tax_rate` parameter.
+///
+/// The percentage is required; the name is optional.
+fn build_tax_rate(rate: &Value) -> Result<Value, ApiError> {
+    let percentage = get_str(rate, &["percentage"])
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .ok_or_else(|| {
+            ApiError::invalid_param(
+                v1(),
+                "lines[][tax_rate][percentage]",
+                "Invalid tax rate percentage",
+            )
+        })?;
+    if !(0.0..=100.0).contains(&percentage) {
+        return Err(ApiError::invalid_param(
+            v1(),
+            "lines[][tax_rate][percentage]",
+            "Invalid tax rate percentage: must be between 0 and 100",
+        ));
+    }
+    let name = get_str(rate, &["name"]).unwrap_or_else(|| "Tax".to_string());
+    Ok(json!({
+        "id": ids::tax_rate_id(),
+        "object": "tax_rate",
+        "active": true,
+        "country": null,
+        "created": time::now_epoch(),
+        "description": name,
+        "display_name": name,
+        "inclusive": false,
+        "livemode": false,
+        "metadata": {},
+        "name": name,
+        "percentage": percentage_value(percentage),
+        "state": null,
+        "tax_type": null,
+    }))
+}
+
+/// Recompute a line's `tax_amounts` from its amount and the percentages held
+/// in its `tax_rates`.
+///
+/// A line without a tax rate has no tax amounts.
+fn recompute_tax_amounts(line: &mut Value) -> Result<(), ApiError> {
+    let amount = get_i64(line, &["amount"]).unwrap_or(0);
+    let rates = line
+        .get("tax_rates")
+        .and_then(|rates| rates.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut tax_amounts = Vec::new();
+    for rate in &rates {
         let percentage = get_str(rate, &["percentage"])
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .ok_or_else(|| {
@@ -133,58 +263,144 @@ fn build_invoice_line(
                     "Invalid tax rate percentage",
                 )
             })?;
-        if !(0.0..=100.0).contains(&percentage) {
-            return Err(ApiError::invalid_param(
-                v1(),
-                "lines[][tax_rate][percentage]",
-                "Invalid tax rate percentage: must be between 0 and 100",
-            ));
-        }
-        let name = get_str(rate, &["name"]).unwrap_or_else(|| "Tax".to_string());
-        let tax_amount = round_tax(amount, percentage);
-        tax_total += tax_amount;
-        let tax_rate = json!({
-            "id": ids::tax_rate_id(),
-            "object": "tax_rate",
-            "active": true,
-            "country": null,
-            "created": time::now_epoch(),
-            "description": name,
-            "display_name": name,
-            "inclusive": false,
-            "livemode": false,
-            "metadata": {},
-            "name": name,
-            "percentage": percentage_value(percentage),
-            "state": null,
-            "tax_type": null,
-        });
-        tax_rates.push(tax_rate.clone());
         tax_amounts.push(json!({
-            "amount": tax_amount,
+            "amount": round_tax(amount, percentage),
             "taxable_amount": amount,
-            "tax_rate": tax_rate,
+            "tax_rate": rate.clone(),
         }));
     }
+    line["tax_amounts"] = Value::Array(tax_amounts);
+    Ok(())
+}
 
-    let line = json!({
+/// Render an invoice line from its draft.
+///
+/// A catalog-priced line and an ad-hoc line carry the same fields; an ad-hoc
+/// line has a null `price` and is priced in the invoice's currency.
+fn render_line(draft: &LineDraft) -> Result<Value, ApiError> {
+    let mut line = json!({
         "id": ids::id("il_"),
         "object": "line_item",
-        "amount": amount,
-        "currency": price.currency,
-        "description": price.nickname,
+        "amount": draft.amount,
+        "currency": draft.currency,
+        "description": draft.description,
         "discountable": true,
         "period": {
             "start": time::now_epoch(),
             "end": time::now_epoch() + 30 * 86_400,
         },
-        "price": price.to_json(),
+        "price": draft.price.clone().unwrap_or(Value::Null),
         "proration": false,
-        "quantity": quantity,
-        "tax_amounts": tax_amounts,
-        "tax_rates": tax_rates,
+        "quantity": draft.quantity,
+        "tax_amounts": Vec::<Value>::new(),
+        "tax_rates": Vec::<Value>::new(),
     });
-    Ok((line, amount, tax_total))
+    if let Some(rate) = &draft.tax_rate {
+        line["tax_rates"] = Value::Array(vec![build_tax_rate(rate)?]);
+    }
+    recompute_tax_amounts(&mut line)?;
+    Ok(line)
+}
+
+/// Render a requested line in the invoice's currency.
+///
+/// The catalog price of a catalog-priced line must already be resolved and
+/// must be in the invoice's currency.
+fn render_item(item: &LineItem, currency: &str) -> Result<Value, ApiError> {
+    let draft = match &item.request {
+        LineRequest::Catalog {
+            quantity, price, ..
+        } => {
+            let price = price.as_ref().ok_or_else(|| {
+                ApiError::internal("catalog price of an invoice line was not resolved")
+            })?;
+            LineDraft {
+                amount: price.unit_amount.unwrap_or(0).saturating_mul(*quantity),
+                currency: currency.to_string(),
+                description: price.nickname.clone(),
+                quantity: Some(*quantity),
+                price: Some(price.to_json()),
+                tax_rate: item.tax_rate.clone(),
+            }
+        }
+        LineRequest::AdHoc {
+            amount,
+            description,
+        } => LineDraft {
+            amount: *amount,
+            currency: currency.to_string(),
+            description: description.clone(),
+            quantity: None,
+            price: None,
+            tax_rate: item.tax_rate.clone(),
+        },
+    };
+    render_line(&draft)
+}
+
+/// Derive an invoice's `subtotal`, `tax_total`, and `total` from its lines.
+///
+/// The subtotal is the sum of the line amounts, the tax total the sum of the
+/// line tax amounts, and the total the two added together.
+fn compute_totals(lines: &[Value]) -> InvoiceTotals {
+    let mut subtotal = 0i64;
+    let mut tax_total = 0i64;
+    for line in lines {
+        subtotal += get_i64(line, &["amount"]).unwrap_or(0);
+        if let Some(taxes) = get_array(line, &["tax_amounts"]) {
+            for tax in taxes {
+                tax_total += get_i64(tax, &["amount"]).unwrap_or(0);
+            }
+        }
+    }
+    InvoiceTotals {
+        subtotal,
+        tax_total,
+        total: subtotal + tax_total,
+    }
+}
+
+/// Reject an invoice that is not a draft: only a draft invoice can have its
+/// lines changed.
+fn ensure_draft(status: &str) -> Result<(), ApiError> {
+    if status == "draft" {
+        return Ok(());
+    }
+    Err(ApiError::invalid_request(
+        v1(),
+        format!("Only a draft invoice can have its lines changed; this invoice is {status}"),
+    ))
+}
+
+/// Accept only the `delete` and `unassign` line behaviors.
+///
+/// Both detach the line: the mock has no invoice item for `unassign` to leave
+/// behind.
+fn ensure_behavior(behavior: Option<&str>) -> Result<(), ApiError> {
+    match behavior {
+        None | Some("delete") | Some("unassign") => Ok(()),
+        Some(other) => Err(ApiError::invalid_param(
+            v1(),
+            "lines[][behavior]",
+            format!("Invalid behavior: {other}. Expected 'delete' or 'unassign'."),
+        )),
+    }
+}
+
+/// Check that a line update changes at least one field.
+///
+/// An update that names a line but changes nothing is rejected rather than
+/// treated as a no-op.
+fn ensure_updatable(item: &Value) -> Result<(), ApiError> {
+    let has = |key: &str| item.get(key).is_some();
+    let has_tax_rate = item.get("tax_rate").is_some_and(|rate| !rate.is_null());
+    if has("quantity") || has("amount") || has("description") || has("price") || has_tax_rate {
+        return Ok(());
+    }
+    Err(ApiError::invalid_request(
+        v1(),
+        "Each line to update must change at least one of quantity, amount, description, price, or tax_rate",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -207,17 +423,19 @@ pub async fn create_invoice(
         return Err(ApiError::missing_param(v1(), "lines"));
     }
 
-    let mut lines = Vec::new();
-    let mut subtotal = 0i64;
-    let mut tax_total = 0i64;
+    let mut items = parse_line_items(&raw_lines)?;
+
+    // The invoice's currency is the currency of its first catalog-priced line,
+    // or `usd` when every line is ad-hoc. It does not change later.
     let mut currency: Option<String> = None;
-    for item in &raw_lines {
-        let price_id = get_str(item, &["price"])
-            .ok_or_else(|| ApiError::missing_param(v1(), "lines[][price]"))?;
-        let quantity = parse_quantity(item)?;
-        let price = load_price(&st, &ctx.account_id, &price_id, "lines[][price]").await?;
+    for item in &mut items {
+        let price_id = match &item.request {
+            LineRequest::Catalog { price_id, .. } => price_id.clone(),
+            LineRequest::AdHoc { .. } => continue,
+        };
+        let loaded = load_price(&st, &ctx.account_id, &price_id, "lines[][price]").await?;
         match &currency {
-            Some(existing) if *existing != price.currency => {
+            Some(existing) if *existing != loaded.currency => {
                 return Err(ApiError::invalid_param(
                     v1(),
                     "lines[][price]",
@@ -225,15 +443,20 @@ pub async fn create_invoice(
                 ));
             }
             Some(_) => {}
-            None => currency = Some(price.currency.clone()),
+            None => currency = Some(loaded.currency.clone()),
         }
-        let (line, amount, line_tax) = build_invoice_line(&price, quantity, item.get("tax_rate"))?;
-        subtotal += amount;
-        tax_total += line_tax;
-        lines.push(line);
+        if let LineRequest::Catalog { price, .. } = &mut item.request {
+            *price = Some(Box::new(loaded));
+        }
     }
+    let currency = currency.unwrap_or_else(|| "usd".to_string());
 
-    let total = subtotal + tax_total;
+    let mut lines = Vec::new();
+    for item in &items {
+        lines.push(render_item(item, &currency)?);
+    }
+    let totals = compute_totals(&lines);
+
     let id = ids::invoice_id();
     let now = time::now_epoch();
     let customer_tax_ids =
@@ -250,13 +473,13 @@ pub async fn create_invoice(
         .bind(&id)
         .bind(&ctx.account_id)
         .bind(&customer_id)
-        .bind(currency.unwrap_or_else(|| "usd".to_string()))
+        .bind(currency)
         .bind(now)
         .bind(get_i64(&params, &["due_date"]))
-        .bind(total)
-        .bind(subtotal)
-        .bind(tax_total)
-        .bind(total)
+        .bind(totals.total)
+        .bind(totals.subtotal)
+        .bind(totals.tax_total)
+        .bind(totals.total)
         .bind(serde_json::to_string(&lines).unwrap_or_else(|_| "[]".to_string()))
         .bind(customer_tax_ids)
         .bind(get_str(&params, &["description"]))
@@ -351,6 +574,297 @@ pub async fn get_invoice_lines(
         invoice.line_list(),
         false,
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Invoice line editing
+// ---------------------------------------------------------------------------
+
+/// Write a new line list to a draft invoice and emit `invoice.updated`.
+///
+/// The write is a compare-and-swap on the line list the caller read, so a
+/// concurrent change is reported instead of being overwritten. The invoice's
+/// totals follow the new lines, and its `updated` timestamp moves.
+async fn write_invoice_lines(
+    st: &AppState,
+    ctx: &AuthContext,
+    invoice: &InvoiceRow,
+    lines: Vec<Value>,
+) -> Result<InvoiceRow, ApiError> {
+    let totals = compute_totals(&lines);
+    let lines_json = serde_json::to_string(&lines).unwrap_or_else(|_| "[]".to_string());
+    let now = time::now_epoch().max(invoice.updated + 1);
+    let amount_remaining = (totals.total - invoice.amount_paid).max(0);
+
+    let event_id = {
+        let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+        let updated = sqlx::query(
+            "UPDATE invoices SET lines = ?1, subtotal = ?2, tax_total = ?3, total = ?4,
+                amount_due = ?5, amount_remaining = ?6, updated = ?7
+             WHERE id = ?8 AND status = 'draft' AND lines = ?9",
+        )
+        .bind(&lines_json)
+        .bind(totals.subtotal)
+        .bind(totals.tax_total)
+        .bind(totals.total)
+        .bind(totals.total)
+        .bind(amount_remaining)
+        .bind(now)
+        .bind(&invoice.id)
+        .bind(&invoice.lines)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+        if updated.rows_affected() == 0 {
+            return Err(ApiError::invalid_request(
+                v1(),
+                format!(
+                    "Invoice {} was changed by another request; please retry",
+                    invoice.id
+                ),
+            ));
+        }
+        let invoice: InvoiceRow = sqlx::query_as("SELECT * FROM invoices WHERE id = ?1")
+            .bind(&invoice.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+        let event_id = events::emit(
+            &mut tx,
+            &ctx.account_id,
+            ctx.is_connected,
+            "invoice.updated",
+            invoice.to_json(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
+        event_id
+    };
+    let _ = st.dispatcher.dispatch_event(&event_id).await;
+
+    load_invoice(st, &ctx.account_id, &invoice.id).await
+}
+
+/// Read the `lines` array of a line-editing request.
+fn request_lines(params: &Value) -> Result<Vec<Value>, ApiError> {
+    let lines = get_array(params, &["lines"]).cloned().unwrap_or_default();
+    if lines.is_empty() {
+        return Err(ApiError::missing_param(v1(), "lines"));
+    }
+    Ok(lines)
+}
+
+/// Add line items to a draft invoice.
+pub async fn add_invoice_lines(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: String,
+) -> Result<Response, ApiError> {
+    let ctx = auth(&st, &headers).await?;
+    let invoice = load_invoice(&st, &ctx.account_id, &id).await?;
+    ensure_draft(&invoice.status)?;
+
+    let params = form::parse_form(&body);
+    let raw_lines = request_lines(&params)?;
+    let mut items = parse_line_items(&raw_lines)?;
+
+    for item in &mut items {
+        let price_id = match &item.request {
+            LineRequest::Catalog { price_id, .. } => price_id.clone(),
+            LineRequest::AdHoc { .. } => continue,
+        };
+        let loaded = load_price(&st, &ctx.account_id, &price_id, "lines[][price]").await?;
+        if loaded.currency != invoice.currency {
+            return Err(ApiError::invalid_request(
+                v1(),
+                format!(
+                    "The price {price_id} is in {} but the invoice is in {}",
+                    loaded.currency, invoice.currency
+                ),
+            ));
+        }
+        if let LineRequest::Catalog { price, .. } = &mut item.request {
+            *price = Some(Box::new(loaded));
+        }
+    }
+
+    let mut lines = invoice.line_list();
+    for item in &items {
+        lines.push(render_item(item, &invoice.currency)?);
+    }
+    let invoice = write_invoice_lines(&st, &ctx, &invoice, lines).await?;
+    Ok(ok(invoice.to_json()))
+}
+
+/// Remove line items from a draft invoice.
+pub async fn remove_invoice_lines(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: String,
+) -> Result<Response, ApiError> {
+    let ctx = auth(&st, &headers).await?;
+    let invoice = load_invoice(&st, &ctx.account_id, &id).await?;
+    ensure_draft(&invoice.status)?;
+
+    let params = form::parse_form(&body);
+    let raw_lines = request_lines(&params)?;
+
+    let mut removals = Vec::new();
+    for item in &raw_lines {
+        let line_id = get_str(item, &["id"]).ok_or_else(|| {
+            ApiError::invalid_request(v1(), "Each line to remove must have an `id`")
+        })?;
+        let behavior = get_str(item, &["behavior"]);
+        ensure_behavior(behavior.as_deref())?;
+        removals.push(line_id);
+    }
+
+    let mut lines = invoice.line_list();
+    for line_id in &removals {
+        let before = lines.len();
+        lines.retain(|line| get_str(line, &["id"]).as_deref() != Some(line_id.as_str()));
+        if lines.len() == before {
+            return Err(ApiError::invalid_request(
+                v1(),
+                format!("No such invoice line: {line_id}"),
+            ));
+        }
+    }
+
+    let invoice = write_invoice_lines(&st, &ctx, &invoice, lines).await?;
+    Ok(ok(invoice.to_json()))
+}
+
+/// Update line items on a draft invoice.
+pub async fn update_invoice_lines(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: String,
+) -> Result<Response, ApiError> {
+    let ctx = auth(&st, &headers).await?;
+    let invoice = load_invoice(&st, &ctx.account_id, &id).await?;
+    ensure_draft(&invoice.status)?;
+
+    let params = form::parse_form(&body);
+    let raw_lines = request_lines(&params)?;
+
+    let mut lines = invoice.line_list();
+    for item in &raw_lines {
+        let line_id = get_str(item, &["id"]).ok_or_else(|| {
+            ApiError::invalid_request(v1(), "Each line to update must have an `id`")
+        })?;
+        let index = lines
+            .iter()
+            .position(|line| get_str(line, &["id"]).as_deref() == Some(line_id.as_str()))
+            .ok_or_else(|| {
+                ApiError::invalid_request(v1(), format!("No such invoice line: {line_id}"))
+            })?;
+        apply_line_updates(&st, &ctx, &invoice, &mut lines[index], item).await?;
+    }
+
+    let invoice = write_invoice_lines(&st, &ctx, &invoice, lines).await?;
+    Ok(ok(invoice.to_json()))
+}
+
+/// Apply the updatable fields of a line item to one of an invoice's lines.
+///
+/// `quantity` recomputes the amount from the line's price, `amount` sets the
+/// amount directly, `description` sets the description, `price` replaces the
+/// catalog price, and `tax_rate` replaces the tax rate. The line's tax
+/// amounts follow its amount and tax rate.
+async fn apply_line_updates(
+    st: &AppState,
+    ctx: &AuthContext,
+    invoice: &InvoiceRow,
+    line: &mut Value,
+    item: &Value,
+) -> Result<(), ApiError> {
+    let (has_quantity, has_amount, has_description, has_price, has_tax_rate) = {
+        let has = |key: &str| item.get(key).is_some();
+        let has_tax_rate = item.get("tax_rate").is_some_and(|rate| !rate.is_null());
+        (
+            has("quantity"),
+            has("amount"),
+            has("description"),
+            has("price"),
+            has_tax_rate,
+        )
+    };
+    ensure_updatable(item)?;
+
+    if has_price {
+        let price_id = get_str(item, &["price"]).ok_or_else(|| {
+            ApiError::invalid_param(v1(), "lines[][price]", "Missing required param: price")
+        })?;
+        let price = load_price(st, &ctx.account_id, &price_id, "lines[][price]").await?;
+        if price.currency != invoice.currency {
+            return Err(ApiError::invalid_request(
+                v1(),
+                format!(
+                    "The price {price_id} is in {} but the invoice is in {}",
+                    price.currency, invoice.currency
+                ),
+            ));
+        }
+        line["price"] = price.to_json();
+    }
+
+    if has_quantity {
+        let quantity = parse_quantity(item)?;
+        line["quantity"] = json!(quantity);
+    }
+
+    // A catalog-priced line's amount follows its price and quantity.
+    if has_price || (has_quantity && !line["price"].is_null()) {
+        let unit_amount = line["price"]
+            .get("unit_amount")
+            .and_then(|amount| amount.as_i64())
+            .unwrap_or(0);
+        let quantity = get_i64(line, &["quantity"]).unwrap_or(1);
+        line["amount"] = json!(unit_amount.saturating_mul(quantity));
+    }
+
+    if has_amount {
+        let amount = get_i64(item, &["amount"])
+            .filter(|amount| *amount >= 0)
+            .ok_or_else(|| {
+                ApiError::invalid_param(
+                    v1(),
+                    "lines[][amount]",
+                    "Invalid amount: must be a non-negative integer",
+                )
+            })?;
+        line["amount"] = json!(amount);
+    }
+
+    if has_description {
+        line["description"] = match get_str(item, &["description"]) {
+            Some(description) => json!(description),
+            None => Value::Null,
+        };
+    }
+
+    if has_tax_rate {
+        let rate = build_tax_rate(&item["tax_rate"])?;
+        let mut rates = line
+            .get("tax_rates")
+            .and_then(|rates| rates.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if rates.is_empty() {
+            rates.push(rate);
+        } else {
+            rates[0] = rate;
+        }
+        line["tax_rates"] = Value::Array(rates);
+    }
+
+    recompute_tax_amounts(line)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -918,6 +1432,159 @@ mod tests {
     fn transition_rejection_is_an_invalid_request() {
         let err = ensure_transition("paid", "open").unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.error_type, "invalid_request_error");
+    }
+
+    #[test]
+    fn parses_catalog_and_ad_hoc_line_items() {
+        let catalog = parse_line_request(&json!({"price": "price_1", "quantity": "3"})).unwrap();
+        match catalog {
+            LineRequest::Catalog {
+                price_id, quantity, ..
+            } => {
+                assert_eq!(price_id, "price_1");
+                assert_eq!(quantity, 3);
+            }
+            LineRequest::AdHoc { .. } => panic!("expected a catalog-priced line"),
+        }
+
+        let ad_hoc =
+            parse_line_request(&json!({"amount": "799", "description": "Consulting"})).unwrap();
+        match ad_hoc {
+            LineRequest::AdHoc {
+                amount,
+                description,
+            } => {
+                assert_eq!(amount, 799);
+                assert_eq!(description.as_deref(), Some("Consulting"));
+            }
+            LineRequest::Catalog { .. } => panic!("expected an ad-hoc line"),
+        }
+
+        // Neither a price nor an amount.
+        let err = parse_line_request(&json!({})).unwrap_err();
+        assert_eq!(err.error_type, "invalid_request_error");
+
+        // An amount that is not a non-negative integer.
+        let err = parse_line_request(&json!({"amount": "-1"})).unwrap_err();
+        assert_eq!(err.error_type, "invalid_request_error");
+    }
+
+    #[test]
+    fn renders_a_catalog_line_and_an_ad_hoc_line_the_same_way() {
+        let catalog = render_line(&LineDraft {
+            amount: 4000,
+            currency: "usd".to_string(),
+            description: Some("Widget".to_string()),
+            quantity: Some(2),
+            price: Some(json!({"id": "price_1", "object": "price", "currency": "usd"})),
+            tax_rate: None,
+        })
+        .unwrap();
+        assert_eq!(catalog["amount"], 4000);
+        assert_eq!(catalog["description"], "Widget");
+        assert_eq!(catalog["price"]["id"], "price_1");
+        assert_eq!(catalog["currency"], "usd");
+
+        let ad_hoc = render_line(&LineDraft {
+            amount: 799,
+            currency: "usd".to_string(),
+            description: Some("Consulting".to_string()),
+            quantity: None,
+            price: None,
+            tax_rate: None,
+        })
+        .unwrap();
+        assert_eq!(ad_hoc["amount"], 799);
+        assert_eq!(ad_hoc["description"], "Consulting");
+        assert!(ad_hoc["price"].is_null());
+        assert_eq!(ad_hoc["currency"], "usd");
+
+        // Both forms carry the same set of fields.
+        let fields = |line: &Value| {
+            let mut fields: Vec<String> = line
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|key| key.to_string())
+                .collect();
+            fields.sort();
+            fields
+        };
+        assert_eq!(fields(&catalog), fields(&ad_hoc));
+    }
+
+    #[test]
+    fn derives_the_totals_from_the_lines() {
+        assert_eq!(
+            compute_totals(&[]),
+            InvoiceTotals {
+                subtotal: 0,
+                tax_total: 0,
+                total: 0
+            }
+        );
+
+        let lines = vec![
+            json!({"amount": 2000, "tax_amounts": [{"amount": 200}]}),
+            json!({"amount": 500, "tax_amounts": []}),
+        ];
+        assert_eq!(
+            compute_totals(&lines),
+            InvoiceTotals {
+                subtotal: 2500,
+                tax_total: 200,
+                total: 2700
+            }
+        );
+    }
+
+    #[test]
+    fn recomputes_a_line_tax_from_its_rate() {
+        let mut line = json!({
+            "amount": 1000,
+            "tax_rates": [{"percentage": 10}],
+        });
+        recompute_tax_amounts(&mut line).unwrap();
+        assert_eq!(line["tax_amounts"][0]["amount"], 100);
+        assert_eq!(line["tax_amounts"][0]["taxable_amount"], 1000);
+
+        // A line without a tax rate has no tax amounts.
+        let mut line = json!({"amount": 1000, "tax_rates": []});
+        recompute_tax_amounts(&mut line).unwrap();
+        assert_eq!(line["tax_amounts"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn rejects_a_non_draft_invoice_and_a_missing_lines_array() {
+        assert!(ensure_draft("draft").is_ok());
+        let err = ensure_draft("open").unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.error_type, "invalid_request_error");
+
+        let err = request_lines(&json!({})).unwrap_err();
+        assert_eq!(err.error_type, "invalid_request_error");
+        assert_eq!(err.param.as_deref(), Some("lines"));
+    }
+
+    #[test]
+    fn rejects_an_unknown_line_behavior() {
+        assert!(ensure_behavior(None).is_ok());
+        assert!(ensure_behavior(Some("delete")).is_ok());
+        assert!(ensure_behavior(Some("unassign")).is_ok());
+        let err = ensure_behavior(Some("archive")).unwrap_err();
+        assert_eq!(err.error_type, "invalid_request_error");
+    }
+
+    #[test]
+    fn rejects_a_line_update_that_changes_nothing() {
+        assert!(ensure_updatable(&json!({"id": "il_1", "quantity": "2"})).is_ok());
+        assert!(ensure_updatable(&json!({"id": "il_1", "amount": "250"})).is_ok());
+        assert!(ensure_updatable(&json!({"id": "il_1", "description": "Revised"})).is_ok());
+        assert!(ensure_updatable(&json!({"id": "il_1", "price": "price_1"})).is_ok());
+        assert!(ensure_updatable(&json!({"id": "il_1", "tax_rate": {"percentage": "10"}})).is_ok());
+
+        let err = ensure_updatable(&json!({"id": "il_1"})).unwrap_err();
         assert_eq!(err.error_type, "invalid_request_error");
     }
 }

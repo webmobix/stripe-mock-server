@@ -26,18 +26,75 @@ The mock onboarding page SHALL collect minimal business information and provide 
 
 ### Requirement: Checkout page
 
-The mock checkout page SHALL render the session summary and a minimal payment form, and SHALL provide controls to simulate card payment success and failure plus alternative payment methods.
+The mock checkout page SHALL render the session summary and a minimal payment form, and SHALL provide labeled controls to simulate payment success and failure plus alternative payment methods, together with a cancel control adjacent to the payment simulation controls.
 
 #### Scenario: Simulate successful card
 
-- **WHEN** the user activates the successful card simulation
+- **WHEN** the user activates the successful payment simulation
 - **THEN** the session completes and the browser is redirected to `success_url`
+
+#### Scenario: Simulate declined payment
+
+- **WHEN** the user activates the declined payment simulation
+- **THEN** the session stays open and the page re-renders with a decline notice
 
 ### Requirement: Shared simulation panel
 
-Every mock page SHALL present a consistent simulation panel offering the applicable controls among KYC verification, IBAN selection, and card payment.
+Every mock page SHALL present the applicable simulation controls among KYC verification, IBAN selection, and payment simulation, without a panel heading or a developer-mode disclaimer.
 
 #### Scenario: Controls present
 
 - **WHEN** a user views a mock hosted page
-- **THEN** the applicable simulation controls are visible and labeled without development tooling
+- **THEN** the applicable simulation controls are visible
+
+#### Scenario: No developer-mode messaging
+
+- **WHEN** a user views a mock hosted page
+- **THEN** the page does not show a "Simulation panel" heading or a "developer-mode simulator" disclaimer
+
+### Requirement: No development-tooling chrome
+
+The shared page shell SHALL NOT display a "TEST MODE" badge or a statement that the tool must not be used in production.
+
+#### Scenario: Tooling chrome absent
+
+- **WHEN** any mock hosted page is rendered
+- **THEN** the HTML contains no "TEST MODE" badge and no "Local simulation tool. Never use in production." text
+
+### Requirement: Automation-stable checkout controls
+
+The checkout payment and cancel controls SHALL expose stable element identifiers so automation can address them independently of their labels.
+
+#### Scenario: Payment control ids
+
+- **WHEN** the checkout page renders
+- **THEN** the successful payment control has id `payment-success` and the declined payment control has id `payment-decline`
+
+#### Scenario: Cancel control id
+
+- **WHEN** the checkout page renders
+- **THEN** the cancel control has id `payment-cancel` and navigates to the session cancel URL
+
+### Requirement: Static demo checkout session
+
+The server SHALL expose a well-known checkout session id so the mock checkout
+page can be opened and completed without first creating a session through the
+API. The id SHALL be `cs_test_static`, the page SHALL render a fixed demo line
+item and total, and requesting the page while the session is `complete` or
+`expired` SHALL reset it to a fresh `open` demo session so it is always
+available for testing.
+
+#### Scenario: Open the page without creating a session
+
+- **WHEN** a browser opens `/mock/checkout/cs_test_static` on a freshly started server
+- **THEN** an HTML checkout page renders with a demo line item, a total, and the simulation controls
+
+#### Scenario: Complete the static page
+
+- **WHEN** the static page is submitted with a successful card simulation
+- **THEN** the session becomes `complete`, a succeeded payment intent exists, and the completion events are created
+
+#### Scenario: Reusable after completion
+
+- **WHEN** the browser opens `/mock/checkout/cs_test_static` again after the session was completed or expired
+- **THEN** a fresh `open` demo session renders instead of the redirect or error page
