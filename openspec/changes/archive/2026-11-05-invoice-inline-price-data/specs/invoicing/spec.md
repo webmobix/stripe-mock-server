@@ -54,12 +54,12 @@ The server SHALL add line items to a draft invoice at `POST /v1/invoices/{id}/ad
 
 ### Requirement: Inline prices on invoice lines
 
-The server SHALL accept an invoice line that carries its own price in `price_data`, at invoice creation and on `add_lines`. The inline price SHALL hold a `currency` and an amount, given as `unit_amount` or as `unit_amount_decimal`, and SHALL name a product either by id (`price_data[product]`) or by description (`price_data[product_data][name]`). The server SHALL price the line at the inline amount times its `quantity`, SHALL describe the line with the name of the product, and SHALL create the product and the price for the line in the catalog, so the price the line carries can be read back. The server SHALL reject an inline price whose `currency` differs from the invoice's currency, an inline price whose `currency` or amount is missing or malformed, and a `price_data[product]` that does not exist for the account.
+The server SHALL accept an invoice line that carries its own price in `price_data`, at invoice creation and on `add_lines`. The inline price SHALL hold a `currency` and an amount, given as `unit_amount` or as `unit_amount_decimal`, and SHALL name a product by id (`price_data[product]`) or by description (`price_data[product_data][name]`). The server SHALL price the line at the inline amount times its `quantity` and SHALL describe it with the name of the product.
 
 #### Scenario: A line with an inline price
 
 - **WHEN** a client adds a line with `price_data` of a `unit_amount` of 2500 and a `quantity` of 2
-- **THEN** the line `amount` is 5000, the line `price` is the price created for the line, and that price can be read back from `GET /v1/prices/{id}`
+- **THEN** the line `amount` is 5000 and the line carries the price created for it
 
 #### Scenario: An inline price with a decimal amount
 
@@ -75,6 +75,15 @@ The server SHALL accept an invoice line that carries its own price in `price_dat
 
 - **WHEN** a client adds a line with `price_data[product]` naming a product of the account
 - **THEN** the price created for the line carries that product
+
+### Requirement: Inline price objects and checks
+
+The server SHALL create the product and the price of an inline `price_data` line in the catalog, so the price the invoice line carries can be read back from `GET /v1/prices/{id}` and the product from `GET /v1/products/{id}`. The server SHALL reject an inline price whose `currency` differs from the invoice's currency, whose `currency` or amount is missing or malformed, and a `price_data[product]` that does not exist for the account.
+
+#### Scenario: The price of an inline line can be read back
+
+- **WHEN** a client adds a line with an inline price
+- **THEN** the price the line carries can be read from `GET /v1/prices/{id}` and the product from `GET /v1/products/{id}`
 
 #### Scenario: An inline price in another currency
 
