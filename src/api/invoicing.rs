@@ -13,7 +13,7 @@ use axum::response::Response;
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::api::v1::{load_price, metadata_from, parse_currency};
+use crate::api::v1::{load_price, load_product, metadata_from, parse_currency};
 use crate::api::{get_array, get_i64, get_str, ok, paginate};
 use crate::auth::{self, AuthContext};
 use crate::error::{ApiError, ApiVersion};
@@ -113,8 +113,8 @@ fn percentage_value(percentage: f64) -> Value {
 // Invoice lines
 // ---------------------------------------------------------------------------
 
-/// A line item as it was requested: either priced from the catalog or written
-/// directly.
+/// A line item as it was requested: priced from the catalog, priced from an
+/// inline price, or written directly.
 #[derive(Debug, Clone)]
 enum LineRequest {
     /// `price` with an optional `quantity`; the price is resolved from the
@@ -124,11 +124,57 @@ enum LineRequest {
         quantity: i64,
         price: Option<Box<PriceRow>>,
     },
+    /// `price_data` with an inline currency and amount; the product and the
+    /// price it names are created for the line, as on Stripe.
+    PriceData {
+        currency: String,
+        amount: i64,
+        quantity: i64,
+        description: Option<String>,
+        objects: Box<InlineObjects>,
+    },
     /// `amount` with an optional `description`.
     AdHoc {
         amount: i64,
         description: Option<String>,
     },
+}
+
+/// The catalog objects Stripe creates for an inline `price_data` line.
+///
+/// Stripe creates a product when the line describes one inline, and a price
+/// for the line either way. The mock creates them too, so the invoice line
+/// carries a price that can be read back like any other.
+#[derive(Debug, Clone)]
+struct InlineObjects {
+    /// The product the line is priced from, when the line named or described
+    /// one.
+    product: Option<InlineProduct>,
+    /// The price created for the line.
+    price: InlinePrice,
+}
+
+/// The product an inline `price_data` line is priced from.
+#[derive(Debug, Clone)]
+struct InlineProduct {
+    id: String,
+    name: String,
+    description: Option<String>,
+    metadata: Value,
+    /// Whether the product still has to be created in the catalog.
+    mint: bool,
+}
+
+/// The price created for an inline `price_data` line.
+#[derive(Debug, Clone)]
+struct InlinePrice {
+    id: String,
+    product_id: String,
+    currency: String,
+    unit_amount: i64,
+    created: i64,
+    /// The price as it is rendered on the invoice line.
+    json: Value,
 }
 
 /// A requested line and the inline tax rate it carries.
@@ -157,8 +203,8 @@ struct InvoiceTotals {
     total: i64,
 }
 
-/// Parse a line item as either catalog-priced (`price`, optional `quantity`)
-/// or ad-hoc (`amount`, optional `description`).
+/// Parse a line item as catalog-priced (`price`, optional `quantity`), inline
+/// priced (`price_data`), or ad-hoc (`amount`, optional `description`).
 fn parse_line_request(item: &Value) -> Result<LineRequest, ApiError> {
     if let Some(price_id) = get_str(item, &["price"]) {
         let quantity = parse_quantity(item)?;
@@ -168,10 +214,13 @@ fn parse_line_request(item: &Value) -> Result<LineRequest, ApiError> {
             price: None,
         });
     }
+    if let Some(price_data) = item.get("price_data").filter(|data| !data.is_null()) {
+        return parse_price_data_request(item, price_data);
+    }
     if item.get("amount").is_none() {
         return Err(ApiError::invalid_request(
             v1(),
-            "Each line must have either a `price` or an `amount`",
+            "Each line must have a `price`, a `price_data`, or an `amount`",
         ));
     }
     let amount = get_i64(item, &["amount"])
@@ -187,6 +236,153 @@ fn parse_line_request(item: &Value) -> Result<LineRequest, ApiError> {
         amount,
         description: get_str(item, &["description"]),
     })
+}
+
+/// Parse a `price_data` line: an inline price with its own currency and
+/// amount.
+///
+/// The product is either named by id or described inline; an inline product
+/// is created for the line, and its name becomes the line's description, as
+/// on Stripe.
+fn parse_price_data_request(item: &Value, price_data: &Value) -> Result<LineRequest, ApiError> {
+    let currency = get_str(price_data, &["currency"])
+        .map(|currency| currency.trim().to_ascii_lowercase())
+        .filter(|currency| currency.len() == 3 && currency.chars().all(|c| c.is_ascii_alphabetic()))
+        .ok_or_else(|| {
+            ApiError::invalid_param(
+                v1(),
+                "lines[][price_data][currency]",
+                "Invalid currency: must be a three-letter ISO code",
+            )
+        })?;
+
+    let amount = match get_i64(price_data, &["unit_amount"]) {
+        Some(amount) if amount >= 0 => amount,
+        Some(_) => {
+            return Err(ApiError::invalid_param(
+                v1(),
+                "lines[][price_data][unit_amount]",
+                "Invalid amount: must be a non-negative integer",
+            ));
+        }
+        None => match get_str(price_data, &["unit_amount_decimal"]) {
+            Some(decimal) => parse_unit_amount_decimal(&decimal).ok_or_else(|| {
+                ApiError::invalid_param(
+                    v1(),
+                    "lines[][price_data][unit_amount_decimal]",
+                    "Invalid amount: must be a non-negative decimal",
+                )
+            })?,
+            None => {
+                return Err(ApiError::invalid_param(
+                    v1(),
+                    "lines[][price_data][unit_amount]",
+                    "Invalid amount: must be a non-negative integer",
+                ));
+            }
+        },
+    };
+
+    let quantity = parse_quantity(item)?;
+    let product_data = price_data
+        .get("product_data")
+        .filter(|data| !data.is_null());
+    let product = match get_str(price_data, &["product"]) {
+        Some(id) => InlineProduct {
+            id,
+            name: String::new(),
+            description: None,
+            metadata: json!({}),
+            // The product already exists; it is only checked, never created.
+            mint: false,
+        },
+        None => InlineProduct {
+            id: ids::product_id(),
+            name: product_data
+                .and_then(|data| get_str(data, &["name"]))
+                .unwrap_or_else(|| "Product".to_string()),
+            description: product_data.and_then(|data| get_str(data, &["description"])),
+            metadata: product_data
+                .and_then(|data| data.get("metadata").cloned())
+                .filter(|metadata| metadata.is_object())
+                .unwrap_or_else(|| json!({})),
+            mint: true,
+        },
+    };
+
+    let created = time::now_epoch();
+    let price = InlinePrice {
+        id: ids::price_id(),
+        product_id: product.id.clone(),
+        currency: currency.clone(),
+        unit_amount: amount,
+        created,
+        json: Value::Null,
+    };
+    let price = InlinePrice {
+        json: PriceRow {
+            id: price.id.clone(),
+            account_id: String::new(),
+            product_id: price.product_id.clone(),
+            currency: price.currency.clone(),
+            unit_amount: Some(price.unit_amount),
+            price_type: "one_time".to_string(),
+            recurring_interval: None,
+            recurring_interval_count: None,
+            nickname: None,
+            active: 1,
+            created,
+            metadata: Some("{}".to_string()),
+        }
+        .to_json(),
+        ..price
+    };
+
+    Ok(LineRequest::PriceData {
+        currency,
+        amount,
+        quantity,
+        description: product_data
+            .and_then(|data| get_str(data, &["name"]))
+            .or_else(|| get_str(item, &["description"])),
+        objects: Box::new(InlineObjects {
+            product: Some(product),
+            price,
+        }),
+    })
+}
+
+/// Parse a decimal amount such as `20.50` into minor units.
+///
+/// The amount is rounded to the nearest minor unit, halves away from zero.
+fn parse_unit_amount_decimal(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (whole, fraction) = match raw.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (raw, ""),
+    };
+    if !fraction.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let whole: i64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    if whole < 0 {
+        return None;
+    }
+    let mut decimals: Vec<char> = fraction.chars().take(3).collect();
+    while decimals.len() < 3 {
+        decimals.push('0');
+    }
+    let hundredths: i64 = decimals[..2].iter().collect::<String>().parse().ok()?;
+    let thousandths = decimals[2].to_digit(10)? as i64;
+    let minor = whole.checked_mul(100)?.checked_add(hundredths)?;
+    Some(if thousandths >= 5 { minor + 1 } else { minor })
 }
 
 /// Parse the `lines` array of a request into line items.
@@ -305,7 +501,8 @@ fn render_line(draft: &LineDraft) -> Result<Value, ApiError> {
 /// Render a requested line in the invoice's currency.
 ///
 /// The catalog price of a catalog-priced line must already be resolved and
-/// must be in the invoice's currency.
+/// must be in the invoice's currency. An inline `price_data` line names its
+/// own currency, which has to be the invoice's.
 fn render_item(item: &LineItem, currency: &str) -> Result<Value, ApiError> {
     let draft = match &item.request {
         LineRequest::Catalog {
@@ -320,6 +517,30 @@ fn render_item(item: &LineItem, currency: &str) -> Result<Value, ApiError> {
                 description: price.nickname.clone(),
                 quantity: Some(*quantity),
                 price: Some(price.to_json()),
+                tax_rate: item.tax_rate.clone(),
+            }
+        }
+        LineRequest::PriceData {
+            currency: price_currency,
+            amount,
+            quantity,
+            description,
+            objects,
+        } => {
+            if price_currency != currency {
+                return Err(ApiError::invalid_request(
+                    v1(),
+                    format!(
+                        "The price_data is in {price_currency} but the invoice is in {currency}"
+                    ),
+                ));
+            }
+            LineDraft {
+                amount: amount.saturating_mul(*quantity),
+                currency: currency.to_string(),
+                description: description.clone(),
+                quantity: Some(*quantity),
+                price: Some(objects.price.json.clone()),
                 tax_rate: item.tax_rate.clone(),
             }
         }
@@ -423,6 +644,107 @@ fn ensure_updatable(item: &Value) -> Result<(), ApiError> {
 // Invoices
 // ---------------------------------------------------------------------------
 
+/// Resolve the catalog objects the requested lines need.
+///
+/// A catalog-priced line's price is loaded from the catalog and has to be in
+/// the invoice's currency; an inline `price_data` line that names a product
+/// has to name one that exists.
+async fn resolve_line_objects(
+    st: &AppState,
+    account_id: &str,
+    items: &mut [LineItem],
+    currency: &str,
+) -> Result<(), ApiError> {
+    for item in items.iter_mut() {
+        match &mut item.request {
+            LineRequest::Catalog {
+                price_id, price, ..
+            } => {
+                let id = price_id.clone();
+                let loaded = load_price(st, account_id, &id, "lines[][price]").await?;
+                if loaded.currency != currency {
+                    return Err(ApiError::invalid_request(
+                        v1(),
+                        format!(
+                            "The price {id} is in {} but the invoice is in {currency}",
+                            loaded.currency
+                        ),
+                    ));
+                }
+                *price = Some(Box::new(loaded));
+            }
+            LineRequest::PriceData { objects, .. } => {
+                if let Some(product) = &objects.product
+                    && !product.mint
+                {
+                    load_product(st, account_id, &product.id, "lines[][price_data][product]")
+                        .await?;
+                }
+            }
+            LineRequest::AdHoc { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// The catalog objects the given lines need created.
+///
+/// Stripe creates a product and a price for every inline `price_data` line.
+fn inline_objects(items: &[LineItem]) -> Vec<InlineObjects> {
+    items
+        .iter()
+        .filter_map(|item| match &item.request {
+            LineRequest::PriceData { objects, .. } => Some((**objects).clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Create the products and prices Stripe creates for inline `price_data` lines.
+///
+/// A product described inline is created; a product named by id already
+/// exists. The price is created either way.
+async fn create_inline_objects(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    account_id: &str,
+    objects: &[InlineObjects],
+) -> Result<(), ApiError> {
+    for object in objects {
+        if let Some(product) = &object.product
+            && product.mint
+        {
+            sqlx::query(
+                "INSERT INTO products (id, account_id, name, description, active, created, default_price, metadata)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, NULL, ?6)",
+            )
+            .bind(&product.id)
+            .bind(account_id)
+            .bind(&product.name)
+            .bind(&product.description)
+            .bind(time::now_epoch())
+            .bind(product.metadata.to_string())
+            .execute(&mut **tx)
+            .await
+            .map_err(ApiError::internal)?;
+        }
+        sqlx::query(
+            "INSERT INTO prices (id, account_id, product_id, currency, unit_amount, price_type,
+                recurring_interval, recurring_interval_count, nickname, active, created, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'one_time', NULL, NULL, NULL, 1, ?6, '{}')",
+        )
+        .bind(&object.price.id)
+        .bind(account_id)
+        .bind(&object.price.product_id)
+        .bind(&object.price.currency)
+        .bind(object.price.unit_amount)
+        .bind(object.price.created)
+        .execute(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+    Ok(())
+}
+
 pub async fn create_invoice(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -442,25 +764,8 @@ pub async fn create_invoice(
     // invoice can be created before it has any.
     let currency = resolve_invoice_currency(&params, &customer)?;
 
-    for item in &mut items {
-        let price_id = match &item.request {
-            LineRequest::Catalog { price_id, .. } => price_id.clone(),
-            LineRequest::AdHoc { .. } => continue,
-        };
-        let loaded = load_price(&st, &ctx.account_id, &price_id, "lines[][price]").await?;
-        if loaded.currency != currency {
-            return Err(ApiError::invalid_request(
-                v1(),
-                format!(
-                    "The price {price_id} is in {} but the invoice is in {currency}",
-                    loaded.currency
-                ),
-            ));
-        }
-        if let LineRequest::Catalog { price, .. } = &mut item.request {
-            *price = Some(Box::new(loaded));
-        }
-    }
+    resolve_line_objects(&st, &ctx.account_id, &mut items, &currency).await?;
+    let objects = inline_objects(&items);
 
     let mut lines = Vec::new();
     for item in &items {
@@ -475,6 +780,7 @@ pub async fn create_invoice(
 
     let event_id = {
         let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+        create_inline_objects(&mut tx, &ctx.account_id, &objects).await?;
         sqlx::query(
             "INSERT INTO invoices (id, account_id, customer, status, currency, created, updated,
                 finalized_at, paid_at, voided_at, due_date, amount_due, amount_paid, amount_remaining,
@@ -657,12 +963,14 @@ pub async fn delete_invoice(
 ///
 /// The write is a compare-and-swap on the line list the caller read, so a
 /// concurrent change is reported instead of being overwritten. The invoice's
-/// totals follow the new lines, and its `updated` timestamp moves.
+/// totals follow the new lines, and its `updated` timestamp moves. The
+/// catalog objects the new lines need are created in the same transaction.
 async fn write_invoice_lines(
     st: &AppState,
     ctx: &AuthContext,
     invoice: &InvoiceRow,
     lines: Vec<Value>,
+    objects: &[InlineObjects],
 ) -> Result<InvoiceRow, ApiError> {
     let totals = compute_totals(&lines);
     let lines_json = serde_json::to_string(&lines).unwrap_or_else(|_| "[]".to_string());
@@ -671,6 +979,7 @@ async fn write_invoice_lines(
 
     let event_id = {
         let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+        create_inline_objects(&mut tx, &ctx.account_id, objects).await?;
         let updated = sqlx::query(
             "UPDATE invoices SET lines = ?1, subtotal = ?2, tax_total = ?3, total = ?4,
                 amount_due = ?5, amount_remaining = ?6, updated = ?7
@@ -743,31 +1052,14 @@ pub async fn add_invoice_lines(
     let raw_lines = request_lines(&params)?;
     let mut items = parse_line_items(&raw_lines)?;
 
-    for item in &mut items {
-        let price_id = match &item.request {
-            LineRequest::Catalog { price_id, .. } => price_id.clone(),
-            LineRequest::AdHoc { .. } => continue,
-        };
-        let loaded = load_price(&st, &ctx.account_id, &price_id, "lines[][price]").await?;
-        if loaded.currency != invoice.currency {
-            return Err(ApiError::invalid_request(
-                v1(),
-                format!(
-                    "The price {price_id} is in {} but the invoice is in {}",
-                    loaded.currency, invoice.currency
-                ),
-            ));
-        }
-        if let LineRequest::Catalog { price, .. } = &mut item.request {
-            *price = Some(Box::new(loaded));
-        }
-    }
+    resolve_line_objects(&st, &ctx.account_id, &mut items, &invoice.currency).await?;
+    let objects = inline_objects(&items);
 
     let mut lines = invoice.line_list();
     for item in &items {
         lines.push(render_item(item, &invoice.currency)?);
     }
-    let invoice = write_invoice_lines(&st, &ctx, &invoice, lines).await?;
+    let invoice = write_invoice_lines(&st, &ctx, &invoice, lines, &objects).await?;
     Ok(ok(invoice.to_json()))
 }
 
@@ -807,7 +1099,7 @@ pub async fn remove_invoice_lines(
         }
     }
 
-    let invoice = write_invoice_lines(&st, &ctx, &invoice, lines).await?;
+    let invoice = write_invoice_lines(&st, &ctx, &invoice, lines, &[]).await?;
     Ok(ok(invoice.to_json()))
 }
 
@@ -839,7 +1131,7 @@ pub async fn update_invoice_lines(
         apply_line_updates(&st, &ctx, &invoice, &mut lines[index], item).await?;
     }
 
-    let invoice = write_invoice_lines(&st, &ctx, &invoice, lines).await?;
+    let invoice = write_invoice_lines(&st, &ctx, &invoice, lines, &[]).await?;
     Ok(ok(invoice.to_json()))
 }
 
@@ -1572,7 +1864,9 @@ mod tests {
                 assert_eq!(price_id, "price_1");
                 assert_eq!(quantity, 3);
             }
-            LineRequest::AdHoc { .. } => panic!("expected a catalog-priced line"),
+            LineRequest::AdHoc { .. } | LineRequest::PriceData { .. } => {
+                panic!("expected a catalog-priced line")
+            }
         }
 
         let ad_hoc =
@@ -1585,7 +1879,9 @@ mod tests {
                 assert_eq!(amount, 799);
                 assert_eq!(description.as_deref(), Some("Consulting"));
             }
-            LineRequest::Catalog { .. } => panic!("expected an ad-hoc line"),
+            LineRequest::Catalog { .. } | LineRequest::PriceData { .. } => {
+                panic!("expected an ad-hoc line")
+            }
         }
 
         // Neither a price nor an amount.
@@ -1639,6 +1935,103 @@ mod tests {
             fields
         };
         assert_eq!(fields(&catalog), fields(&ad_hoc));
+    }
+
+    #[test]
+    fn parses_an_inline_price_data_line() {
+        let request = parse_line_request(&json!({
+            "price_data": {
+                "currency": "EUR",
+                "unit_amount": 2500,
+                "product_data": {"name": "Consulting"}
+            },
+            "quantity": "2",
+        }))
+        .unwrap();
+        match request {
+            LineRequest::PriceData {
+                currency,
+                amount,
+                quantity,
+                description,
+                objects,
+            } => {
+                assert_eq!(currency, "eur");
+                assert_eq!(amount, 2500);
+                assert_eq!(quantity, 2);
+                assert_eq!(description.as_deref(), Some("Consulting"));
+                assert_eq!(objects.price.unit_amount, 2500);
+                assert_eq!(objects.price.currency, "eur");
+                assert_eq!(objects.price.json["object"], "price");
+                assert_eq!(objects.price.json["unit_amount"], 2500);
+                // The product is described inline, so it is created with the line.
+                let product = objects.product.expect("an inline product");
+                assert!(product.mint);
+                assert!(product.id.starts_with("prod_"));
+                assert_eq!(product.name, "Consulting");
+            }
+            _ => panic!("expected an inline price"),
+        }
+    }
+
+    #[test]
+    fn parses_a_price_data_line_with_a_decimal_amount() {
+        let request = parse_line_request(&json!({
+            "price_data": {"currency": "usd", "unit_amount_decimal": "20.50"}
+        }))
+        .unwrap();
+        match request {
+            LineRequest::PriceData { amount, .. } => assert_eq!(amount, 2050),
+            _ => panic!("expected an inline price"),
+        }
+    }
+
+    #[test]
+    fn an_inline_price_needs_a_currency_and_an_amount() {
+        let err = parse_line_request(&json!({"price_data": {"unit_amount": 100}})).unwrap_err();
+        assert_eq!(err.error_type, "invalid_request_error");
+        assert_eq!(err.param.as_deref(), Some("lines[][price_data][currency]"));
+
+        let err = parse_line_request(&json!({"price_data": {"currency": "usd"}})).unwrap_err();
+        assert_eq!(err.error_type, "invalid_request_error");
+        assert_eq!(
+            err.param.as_deref(),
+            Some("lines[][price_data][unit_amount]")
+        );
+
+        let err =
+            parse_line_request(&json!({"price_data": {"currency": "usd", "unit_amount": -1}}))
+                .unwrap_err();
+        assert_eq!(err.error_type, "invalid_request_error");
+    }
+
+    #[test]
+    fn an_inline_price_in_another_currency_is_rejected() {
+        let item = LineItem {
+            request: parse_line_request(&json!({
+                "price_data": {"currency": "eur", "unit_amount": 100}
+            }))
+            .unwrap(),
+            tax_rate: None,
+        };
+        let err = render_item(&item, "usd").unwrap_err();
+        assert_eq!(err.error_type, "invalid_request_error");
+        assert!(err.message.contains("eur"), "{}", err.message);
+    }
+
+    #[test]
+    fn parses_a_decimal_amount_into_minor_units() {
+        assert_eq!(parse_unit_amount_decimal("20.50"), Some(2050));
+        assert_eq!(parse_unit_amount_decimal("20.5"), Some(2050));
+        assert_eq!(parse_unit_amount_decimal("20"), Some(2000));
+        assert_eq!(parse_unit_amount_decimal("0.05"), Some(5));
+        assert_eq!(parse_unit_amount_decimal(".99"), Some(99));
+        assert_eq!(parse_unit_amount_decimal("20.505"), Some(2051));
+        assert_eq!(parse_unit_amount_decimal("20.504"), Some(2050));
+        assert_eq!(parse_unit_amount_decimal("-1.00"), None);
+        assert_eq!(parse_unit_amount_decimal("abc"), None);
+        assert_eq!(parse_unit_amount_decimal("1.2.3"), None);
+        assert_eq!(parse_unit_amount_decimal(""), None);
     }
 
     #[test]

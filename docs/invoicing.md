@@ -88,6 +88,33 @@ The ad-hoc line form is accepted both at invoice creation and on
 [`add_lines`](#add-lines). A line that carries neither a `price` nor an
 `amount` is rejected.
 
+### Inline prices
+
+A line may carry its own price in `price_data`, instead of naming a price from
+the catalog. The inline price has its own `currency` and its own amount, given
+as `unit_amount` or as `unit_amount_decimal`, and it names a product either
+by id (`price_data[product]`) or by description
+(`price_data[product_data][name]`):
+
+```bash
+curl -s -X POST $BASE/v1/invoices \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode "customer=$CID" \
+  --data-urlencode "lines[0][price_data][currency]=usd" \
+  --data-urlencode "lines[0][price_data][unit_amount]=2500" \
+  --data-urlencode "lines[0][price_data][product_data][name]=Consulting" \
+  --data-urlencode "lines[0][quantity]=2"
+```
+
+The line is priced at 2500 per unit, so it amounts to 5000, and it is
+described with the name of the product. As on Stripe, the mock creates the
+product and the price for the line: the line carries the price, and both
+objects can be read back from `/v1/products/{id}` and `/v1/prices/{id}`.
+
+The inline price is accepted both at invoice creation and on
+[`add_lines`](#add-lines). Its currency has to be the invoice's currency, and
+a `price_data[product]` that does not exist is rejected.
+
 ### Tax rates
 
 A line may carry an inline tax rate. The percentage is required; the name is

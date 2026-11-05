@@ -697,6 +697,25 @@ pub(crate) async fn load_price(
     price.ok_or_else(|| ApiError::invalid_param(v1(), param, format!("No such price: {price_id}")))
 }
 
+/// Load a product owned by the account.
+pub(crate) async fn load_product(
+    st: &AppState,
+    account_id: &str,
+    product_id: &str,
+    param: &str,
+) -> Result<ProductRow, ApiError> {
+    let product: Option<ProductRow> =
+        sqlx::query_as("SELECT * FROM products WHERE id = ?1 AND account_id = ?2")
+            .bind(product_id)
+            .bind(account_id)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    product.ok_or_else(|| {
+        ApiError::invalid_param(v1(), param, format!("No such product: {product_id}"))
+    })
+}
+
 /// Read an optional `quantity`: absent means 1, anything else must be a positive integer.
 fn parse_quantity(item: &Value) -> Result<i64, ApiError> {
     match get_str(item, &["quantity"]) {

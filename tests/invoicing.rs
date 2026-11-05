@@ -2228,3 +2228,211 @@ async fn a_customer_carries_its_currency() {
         .unwrap();
     assert_eq!(customer["currency"], "gbp");
 }
+
+// ---------------------------------------------------------------------------
+// Inline price data
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_line_can_be_added_with_inline_price_data() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+
+    let invoice = post_invoice(&server, &key, &[("customer", customer.as_str())]).await;
+    let invoice: Value = invoice.json().await.unwrap();
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[
+            ("lines[0][price_data][currency]", "usd"),
+            ("lines[0][price_data][unit_amount]", "2500"),
+            ("lines[0][price_data][product_data][name]", "Consulting"),
+            ("lines[0][quantity]", "2"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let invoice: Value = response.json().await.unwrap();
+    assert_eq!(invoice["subtotal"], 5000);
+    assert_eq!(invoice["total"], 5000);
+
+    let line = &invoice["lines"]["data"][0];
+    assert_eq!(line["amount"], 5000);
+    assert_eq!(line["quantity"], 2);
+    assert_eq!(line["currency"], "usd");
+    // The product described inline names the line.
+    assert_eq!(line["description"], "Consulting");
+    // The price created for the line is carried by the line.
+    assert_eq!(line["price"]["object"], "price");
+    assert_eq!(line["price"]["unit_amount"], 2500);
+    assert_eq!(line["price"]["currency"], "usd");
+    assert_eq!(line["price"]["type"], "one_time");
+
+    // The product and the price are real objects, so they can be read back.
+    let product_id = line["price"]["product"].as_str().unwrap().to_string();
+    let price_id = line["price"]["id"].as_str().unwrap().to_string();
+    let product: Value = server
+        .client
+        .get(server.url(&format!("/v1/products/{product_id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(product["id"], product_id.as_str());
+    assert_eq!(product["name"], "Consulting");
+
+    let price: Value = server
+        .client
+        .get(server.url(&format!("/v1/prices/{price_id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(price["id"], price_id.as_str());
+    assert_eq!(price["unit_amount"], 2500);
+    assert_eq!(price["currency"], "usd");
+    assert_eq!(price["product"], product_id.as_str());
+}
+
+#[tokio::test]
+async fn an_inline_price_can_use_a_decimal_amount_and_an_existing_product() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let product: Value = server
+        .client
+        .post(server.url("/v1/products"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[("name", "Widget")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let product_id = product["id"].as_str().unwrap().to_string();
+
+    let invoice = post_invoice(&server, &key, &[("customer", customer.as_str())]).await;
+    let invoice: Value = invoice.json().await.unwrap();
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[
+            ("lines[0][price_data][currency]", "usd"),
+            ("lines[0][price_data][unit_amount_decimal]", "20.50"),
+            ("lines[0][price_data][product]", product_id.as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let invoice: Value = response.json().await.unwrap();
+    let line = &invoice["lines"]["data"][0];
+    assert_eq!(line["amount"], 2050);
+    assert_eq!(line["price"]["unit_amount"], 2050);
+    // The product the line names is used as it is.
+    assert_eq!(line["price"]["product"], product_id.as_str());
+}
+
+#[tokio::test]
+async fn an_inline_price_is_checked_against_the_invoice() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+
+    let invoice = post_invoice(&server, &key, &[("customer", customer.as_str())]).await;
+    let invoice: Value = invoice.json().await.unwrap();
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    // Another currency than the invoice.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[
+            ("lines[0][price_data][currency]", "eur"),
+            ("lines[0][price_data][unit_amount]", "100"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // An unknown product.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[
+            ("lines[0][price_data][currency]", "usd"),
+            ("lines[0][price_data][unit_amount]", "100"),
+            ("lines[0][price_data][product]", "prod_missing"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // A missing currency.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[("lines[0][price_data][unit_amount]", "100")],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["param"], "lines[][price_data][currency]");
+
+    // The invoice is untouched.
+    let invoice = get_invoice(&server, &key, &id).await;
+    assert_eq!(invoice["lines"]["data"].as_array().unwrap().len(), 0);
+    assert_eq!(invoice["total"], 0);
+}
+
+#[tokio::test]
+async fn an_invoice_can_be_created_with_an_inline_price() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+
+    let response = post_invoice(
+        &server,
+        &key,
+        &[
+            ("customer", customer.as_str()),
+            ("lines[0][price_data][currency]", "usd"),
+            ("lines[0][price_data][unit_amount]", "1500"),
+            ("lines[0][price_data][product_data][name]", "Ad offer"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let invoice: Value = response.json().await.unwrap();
+    assert_eq!(invoice["subtotal"], 1500);
+    assert_eq!(invoice["total"], 1500);
+    let line = &invoice["lines"]["data"][0];
+    assert_eq!(line["amount"], 1500);
+    assert_eq!(line["description"], "Ad offer");
+    assert_eq!(line["price"]["unit_amount"], 1500);
+}

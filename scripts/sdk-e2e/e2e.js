@@ -256,6 +256,51 @@ const postForm = (url, params) =>
   if (!currencyError) throw new Error('a price in another currency was accepted');
   console.log('foreign price rejected', currencyError.code ?? currencyError.message);
 
+  // --- an inline price (price_data) ------------------------------------------
+  const inline = await stripe.invoices.create({ customer: taxCustomer.id });
+  const withInline = await stripe.invoices.addLines(inline.id, {
+    lines: [
+      {
+        price_data: {
+          currency: 'usd',
+          unit_amount: 2500,
+          product_data: { name: 'Ad offer' },
+        },
+        quantity: 2,
+      },
+    ],
+  });
+  const inlineLine = withInline.lines.data[0];
+  console.log(
+    'inline price invoice',
+    withInline.status,
+    withInline.total,
+    inlineLine.description,
+    inlineLine.price.unit_amount,
+  );
+  if (withInline.total !== 5000) throw new Error('bad inline total');
+  if (inlineLine.amount !== 5000) throw new Error('bad inline line amount');
+  if (inlineLine.description !== 'Ad offer') throw new Error('bad inline description');
+  if (inlineLine.price.unit_amount !== 2500) throw new Error('bad inline price amount');
+  if (inlineLine.price.currency !== 'usd') throw new Error('bad inline price currency');
+
+  // The price created for the line is a real price.
+  const inlinePrice = await stripe.prices.retrieve(inlineLine.price.id);
+  if (inlinePrice.unit_amount !== 2500) throw new Error('inline price not created');
+  console.log('inline price created', inlinePrice.id, inlinePrice.product);
+
+  // An inline price in another currency is rejected.
+  let inlineCurrencyError = null;
+  try {
+    await stripe.invoices.addLines(inline.id, {
+      lines: [{ price_data: { currency: 'eur', unit_amount: 100 } }],
+    });
+  } catch (e) {
+    inlineCurrencyError = e;
+  }
+  if (!inlineCurrencyError) throw new Error('an inline price in another currency was accepted');
+  console.log('foreign inline price rejected', inlineCurrencyError.code ?? inlineCurrencyError.message);
+
   // --- settle a second invoice through the control plane --------------------
   const second = await stripe.invoices.create({
     customer: taxCustomer.id,
