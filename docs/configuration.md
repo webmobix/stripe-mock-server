@@ -9,7 +9,7 @@ The committed [`config.toml`](../config.toml) is a valid sample.
 |-------|------|---------|-------------|
 | `bind` | string | `"127.0.0.1"` | Interface the server (including `/internal/**`) binds to. |
 | `port` | integer | required | TCP port. |
-| `public_base_url` | string | required | Base URL used when minting onboarding/checkout URLs and redirecting. |
+| `public_base_url` | string | required | Base URL used when minting onboarding/checkout URLs, the hosted invoice page, and redirecting. |
 
 ## `[database]`
 
