@@ -13,7 +13,7 @@ use axum::response::Response;
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::api::v1::{load_price, metadata_from};
+use crate::api::v1::{load_price, metadata_from, parse_currency};
 use crate::api::{get_array, get_i64, get_str, ok, paginate};
 use crate::auth::{self, AuthContext};
 use crate::error::{ApiError, ApiVersion};
@@ -360,6 +360,22 @@ fn compute_totals(lines: &[Value]) -> InvoiceTotals {
     }
 }
 
+/// The currency an invoice is created in.
+///
+/// The request's `currency` wins, then the customer's currency, then `usd`.
+/// The choice is made once, at creation, so that the lines added afterwards
+/// are validated against it.
+fn resolve_invoice_currency(params: &Value, customer: &CustomerRow) -> Result<String, ApiError> {
+    if let Some(currency) = parse_currency(params)? {
+        return Ok(currency);
+    }
+    Ok(customer
+        .currency
+        .clone()
+        .filter(|currency| !currency.is_empty())
+        .unwrap_or_else(|| "usd".to_string()))
+}
+
 /// Reject an invoice that is not a draft: only a draft invoice can have its
 /// lines changed.
 fn ensure_draft(status: &str) -> Result<(), ApiError> {
@@ -419,37 +435,32 @@ pub async fn create_invoice(
     let customer = load_customer(&st, &ctx.account_id, &customer_id).await?;
 
     let raw_lines = get_array(&params, &["lines"]).cloned().unwrap_or_default();
-    if raw_lines.is_empty() {
-        return Err(ApiError::missing_param(v1(), "lines"));
-    }
-
     let mut items = parse_line_items(&raw_lines)?;
 
-    // The invoice's currency is the currency of its first catalog-priced line,
-    // or `usd` when every line is ad-hoc. It does not change later.
-    let mut currency: Option<String> = None;
+    // The invoice's currency is fixed at creation: the request's `currency`,
+    // then the customer's, then `usd`. It never follows the lines, so an
+    // invoice can be created before it has any.
+    let currency = resolve_invoice_currency(&params, &customer)?;
+
     for item in &mut items {
         let price_id = match &item.request {
             LineRequest::Catalog { price_id, .. } => price_id.clone(),
             LineRequest::AdHoc { .. } => continue,
         };
         let loaded = load_price(&st, &ctx.account_id, &price_id, "lines[][price]").await?;
-        match &currency {
-            Some(existing) if *existing != loaded.currency => {
-                return Err(ApiError::invalid_param(
-                    v1(),
-                    "lines[][price]",
-                    "All invoice lines must use the same currency",
-                ));
-            }
-            Some(_) => {}
-            None => currency = Some(loaded.currency.clone()),
+        if loaded.currency != currency {
+            return Err(ApiError::invalid_request(
+                v1(),
+                format!(
+                    "The price {price_id} is in {} but the invoice is in {currency}",
+                    loaded.currency
+                ),
+            ));
         }
         if let LineRequest::Catalog { price, .. } = &mut item.request {
             *price = Some(Box::new(loaded));
         }
     }
-    let currency = currency.unwrap_or_else(|| "usd".to_string());
 
     let mut lines = Vec::new();
     for item in &items {
@@ -574,6 +585,68 @@ pub async fn get_invoice_lines(
         invoice.line_list(),
         false,
     )))
+}
+
+/// Delete a draft invoice.
+///
+/// Stripe only lets a draft invoice be deleted; an invoice that has been
+/// finalized has to be voided instead. The invoice is removed and the
+/// tombstone Stripe returns is given back: the `id` of the invoice, its
+/// `object`, and `deleted` set to true.
+pub async fn delete_invoice(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let ctx = auth(&st, &headers).await?;
+    let invoice = load_invoice(&st, &ctx.account_id, &id).await?;
+    if invoice.status != "draft" {
+        return Err(ApiError::invalid_request(
+            v1(),
+            format!(
+                "Only a draft invoice can be deleted; this invoice is {}",
+                invoice.status
+            ),
+        ));
+    }
+
+    let event_id = {
+        let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+        // Claim the invoice first so a concurrent request cannot delete it twice.
+        let claimed = sqlx::query("DELETE FROM invoices WHERE id = ?1 AND status = 'draft'")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+        if claimed.rows_affected() == 0 {
+            return Err(ApiError::invalid_request(
+                v1(),
+                format!(
+                    "Only a draft invoice can be deleted; this invoice is {}",
+                    invoice.status
+                ),
+            ));
+        }
+        let event_id = events::emit(
+            &mut tx,
+            &ctx.account_id,
+            ctx.is_connected,
+            "invoice.deleted",
+            invoice.to_json(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
+        event_id
+    };
+    let _ = st.dispatcher.dispatch_event(&event_id).await;
+
+    // Stripe returns a deleted tombstone, not the full invoice.
+    Ok(ok(json!({
+        "id": invoice.id,
+        "object": "invoice",
+        "deleted": true,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1052,15 @@ pub async fn finalize_invoice(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let ctx = auth(&st, &headers).await?;
+    let invoice = load_invoice(&st, &ctx.account_id, &id).await?;
+    // The lines may have been added after the invoice was created, so they are
+    // checked here rather than at creation.
+    if invoice.line_list().is_empty() {
+        return Err(ApiError::invalid_request(
+            v1(),
+            "You cannot finalize an invoice with no lines",
+        ));
+    }
     let invoice = transition_invoice(&st, &ctx, &id, "open", "invoice.finalized").await?;
     Ok(ok(invoice.to_json()))
 }
@@ -1433,6 +1515,51 @@ mod tests {
         let err = ensure_transition("paid", "open").unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(err.error_type, "invalid_request_error");
+    }
+
+    /// A customer with the given default currency.
+    fn customer_with_currency(currency: Option<&str>) -> CustomerRow {
+        CustomerRow {
+            id: "cus_1".into(),
+            account_id: "acct_1".into(),
+            email: None,
+            name: None,
+            currency: currency.map(|c| c.to_string()),
+            created: 10,
+            tax_ids: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn the_invoice_currency_follows_the_request_then_the_customer() {
+        let customer = customer_with_currency(Some("eur"));
+
+        // The request wins.
+        assert_eq!(
+            resolve_invoice_currency(&json!({"currency": "GBP"}), &customer).unwrap(),
+            "gbp"
+        );
+        // Then the customer.
+        assert_eq!(
+            resolve_invoice_currency(&json!({}), &customer).unwrap(),
+            "eur"
+        );
+        // Then usd.
+        assert_eq!(
+            resolve_invoice_currency(&json!({}), &customer_with_currency(None)).unwrap(),
+            "usd"
+        );
+    }
+
+    #[test]
+    fn a_malformed_invoice_currency_is_rejected() {
+        let err =
+            resolve_invoice_currency(&json!({"currency": "euro"}), &customer_with_currency(None))
+                .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.error_type, "invalid_request_error");
+        assert_eq!(err.param.as_deref(), Some("currency"));
     }
 
     #[test]

@@ -59,7 +59,7 @@ receive both formats, exactly as Stripe requires a separate endpoint per format.
 ```toml
 # v1 snapshot events (Your account + Connected accounts)
 [[event_destinations]]
-name = "snapshot-app"
+name = "platform-app"
 event_payload = "snapshot"
 events_from = ["@self", "@accounts"]
 enabled_events = ["*"]

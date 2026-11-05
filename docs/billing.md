@@ -32,6 +32,22 @@ curl -s -X POST $BASE/v1/customers \
 A tax id entry with a type but no value is rejected with an
 `invalid_request_error`.
 
+### Currency
+
+A customer may carry a default `currency`. It is the currency the invoices
+raised against the customer are priced in, unless the invoice names one
+itself.
+
+```bash
+curl -s -X POST $BASE/v1/customers \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode 'email=buyer@example.com' \
+  --data-urlencode 'currency=eur'
+```
+
+A `currency` that is not a three-letter ISO code is rejected with an
+`invalid_request_error`.
+
 ### List, update, and delete
 
 ```bash

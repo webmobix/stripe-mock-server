@@ -48,9 +48,7 @@ pub async fn spawn() -> TestServer {
 
 /// Boot a fresh server, optionally pointing a snapshot event destination at a receiver.
 pub async fn spawn_with_receiver(receiver_url: Option<String>) -> TestServer {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let db_path = std::env::temp_dir().join(format!(
         "stripe-mock-it-{}.db",
@@ -111,9 +109,7 @@ webhook_endpoint = {{ url = "{target_url}" }}
 /// Boot a fresh server with a single config-declared thin event destination
 /// pointing at the receiver.
 pub async fn spawn_with_thin_destination(receiver_url: String) -> TestServer {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let db_path = std::env::temp_dir().join(format!(
         "stripe-mock-it-{}.db",

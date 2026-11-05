@@ -8,7 +8,7 @@ Manages customers and subscriptions, including account-backed customers, so recu
 
 ### Requirement: Create and retrieve customers
 
-The server SHALL create customers at `POST /v1/customers` and retrieve them at `GET /v1/customers/{id}` with a `cus_` id. A customer MAY carry tax identification data supplied as `tax_id_data[][type]` and `tax_id_data[][value]`; the server SHALL store each entry as a `tax_ids` object with a `txi_` id, the given `type` and `value`, and expose them on the customer.
+The server SHALL create customers at `POST /v1/customers` and retrieve them at `GET /v1/customers/{id}` with a `cus_` id. A customer MAY carry tax identification data supplied as `tax_id_data[][type]` and `tax_id_data[][value]`; the server SHALL store each entry as a `tax_ids` object with a `txi_` id, the given `type` and `value`, and expose them on the customer. A customer MAY carry a default `currency`; the server SHALL store it and expose it on the customer.
 
 #### Scenario: Create customer
 
@@ -24,6 +24,11 @@ The server SHALL create customers at `POST /v1/customers` and retrieve them at `
 
 - **WHEN** a client creates a customer with a `tax_id_data[][type]` but no matching `value`
 - **THEN** the server responds with an `invalid_request_error` naming the missing value and creates no customer
+
+#### Scenario: Create customer with a currency
+
+- **WHEN** a client creates a customer with a `currency` of `eur`
+- **THEN** the customer `currency` is `eur`
 
 ### Requirement: Create subscriptions
 
@@ -68,7 +73,7 @@ The server SHALL list customers at `GET /v1/customers` with the list envelope, f
 
 ### Requirement: Update customers
 
-The server SHALL update a customer at `POST /v1/customers/{id}`, accepting `email`, `name`, `metadata`, and additional `tax_id_data[]` entries. The server SHALL create a `customer.updated` event.
+The server SHALL update a customer at `POST /v1/customers/{id}`, accepting `email`, `name`, `metadata`, `currency`, and additional `tax_id_data[]` entries. The server SHALL create a `customer.updated` event.
 
 #### Scenario: Update a customer
 
@@ -79,6 +84,16 @@ The server SHALL update a customer at `POST /v1/customers/{id}`, accepting `emai
 
 - **WHEN** a client updates a customer with a new `tax_id_data[][type]` and `tax_id_data[][value]`
 - **THEN** the customer `tax_ids` contains the original entries plus the new one
+
+#### Scenario: Change a customer's currency
+
+- **WHEN** a client updates a customer with a `currency` of `gbp`
+- **THEN** the customer `currency` is `gbp`
+
+#### Scenario: A malformed currency
+
+- **WHEN** a client creates or updates a customer with a `currency` that is not a three-letter ISO code
+- **THEN** the server responds with an `invalid_request_error` naming `currency` and the customer is unchanged
 
 ### Requirement: Delete customers
 

@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS customers (
     account_id TEXT NOT NULL,
     email TEXT,
     name TEXT,
+    currency TEXT,
     created INTEGER NOT NULL,
     tax_ids TEXT,
     metadata TEXT
@@ -274,6 +275,9 @@ async fn migrate_legacy_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // Columns added for customer tax ids and invoice-linked payment intents.
     add_column_if_missing(pool, "customers", "tax_ids", "TEXT").await?;
     add_column_if_missing(pool, "payment_intents", "invoice", "TEXT").await?;
+    // Column added for the customer's default currency, which an invoice falls
+    // back to when the request does not name one.
+    add_column_if_missing(pool, "customers", "currency", "TEXT").await?;
     Ok(())
 }
 

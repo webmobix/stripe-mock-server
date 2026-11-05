@@ -1845,3 +1845,386 @@ async fn reset_clears_invoices() {
         .unwrap();
     assert_eq!(list["data"].as_array().unwrap().len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Stripe SDK 22.6 invoice lifecycle
+// ---------------------------------------------------------------------------
+
+/// Create a customer with a default currency and return its id.
+async fn create_customer_in_currency(
+    server: &TestServer,
+    key: &str,
+    email: &str,
+    currency: &str,
+) -> String {
+    let customer: Value = server
+        .client
+        .post(server.url("/v1/customers"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[("email", email), ("name", "Buyer"), ("currency", currency)])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    customer["id"].as_str().unwrap().to_string()
+}
+
+/// Create an invoice and return the raw response.
+async fn post_invoice(server: &TestServer, key: &str, form: &[(&str, &str)]) -> reqwest::Response {
+    server
+        .client
+        .post(server.url("/v1/invoices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(form)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_invoice_can_be_created_empty_and_given_its_lines_afterwards() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 2000).await;
+
+    // No lines at all: a valid empty draft, as the SDK creates it.
+    let response = post_invoice(&server, &key, &[("customer", customer.as_str())]).await;
+    assert_eq!(response.status(), 200);
+    let invoice: Value = response.json().await.unwrap();
+    assert_eq!(invoice["status"], "draft");
+    assert_eq!(invoice["currency"], "usd");
+    assert_eq!(invoice["subtotal"], 0);
+    assert_eq!(invoice["tax_total"], 0);
+    assert_eq!(invoice["total"], 0);
+    assert_eq!(invoice["lines"]["data"].as_array().unwrap().len(), 0);
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    // The lines are added afterwards.
+    let response = post_lines(
+        &server,
+        &key,
+        &id,
+        "add_lines",
+        &[
+            ("lines[0][price]", price.as_str()),
+            ("lines[0][quantity]", "2"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let invoice: Value = response.json().await.unwrap();
+    assert_eq!(invoice["subtotal"], 4000);
+    assert_eq!(invoice["total"], 4000);
+    assert_eq!(invoice["lines"]["data"].as_array().unwrap().len(), 1);
+
+    // And the invoice moves through the rest of its life.
+    let response = server
+        .client
+        .post(server.url(&format!("/v1/invoices/{id}/finalize")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let invoice: Value = response.json().await.unwrap();
+    assert_eq!(invoice["status"], "open");
+    assert_eq!(invoice["amount_due"], 4000);
+
+    let response = server
+        .client
+        .post(server.url(&format!("/v1/invoices/{id}/pay")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let invoice: Value = response.json().await.unwrap();
+    assert_eq!(invoice["status"], "paid");
+    assert_eq!(invoice["amount_paid"], 4000);
+    assert_eq!(invoice["amount_remaining"], 0);
+}
+
+#[tokio::test]
+async fn an_invoice_with_no_lines_cannot_be_finalized() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+
+    let response = post_invoice(&server, &key, &[("customer", customer.as_str())]).await;
+    let invoice: Value = response.json().await.unwrap();
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    let response = server
+        .client
+        .post(server.url(&format!("/v1/invoices/{id}/finalize")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // The invoice is still a draft.
+    let invoice = get_invoice(&server, &key, &id).await;
+    assert_eq!(invoice["status"], "draft");
+}
+
+#[tokio::test]
+async fn the_invoice_currency_comes_from_the_request() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let euro_price = create_price_in_currency(&server, &key, 1000, "eur").await;
+    let dollar_price = create_price(&server, &key, 1000).await;
+
+    // The request names the currency, and the lines follow it.
+    let response = post_invoice(
+        &server,
+        &key,
+        &[
+            ("customer", customer.as_str()),
+            ("currency", "eur"),
+            ("lines[0][price]", euro_price.as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let invoice: Value = response.json().await.unwrap();
+    assert_eq!(invoice["currency"], "eur");
+    assert_eq!(invoice["lines"]["data"][0]["currency"], "eur");
+
+    // A price in another currency than the invoice is rejected.
+    let response = post_invoice(
+        &server,
+        &key,
+        &[
+            ("customer", customer.as_str()),
+            ("currency", "eur"),
+            ("lines[0][price]", dollar_price.as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // An ad-hoc line is priced in the invoice's currency.
+    let response = post_invoice(
+        &server,
+        &key,
+        &[
+            ("customer", customer.as_str()),
+            ("currency", "eur"),
+            ("lines[0][amount]", "500"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let invoice: Value = response.json().await.unwrap();
+    assert_eq!(invoice["currency"], "eur");
+    assert_eq!(invoice["lines"]["data"][0]["currency"], "eur");
+
+    // A malformed currency is rejected.
+    let response = post_invoice(
+        &server,
+        &key,
+        &[("customer", customer.as_str()), ("currency", "euro")],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["param"], "currency");
+}
+
+#[tokio::test]
+async fn the_invoice_currency_falls_back_to_the_customer() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let euro_customer = create_customer_in_currency(&server, &key, "eu@example.com", "eur").await;
+    let plain_customer = create_customer(&server, &key, "buyer@example.com").await;
+    let euro_price = create_price_in_currency(&server, &key, 1000, "eur").await;
+
+    // The customer's currency is used when the request names none.
+    let response = post_invoice(
+        &server,
+        &key,
+        &[
+            ("customer", euro_customer.as_str()),
+            ("lines[0][price]", euro_price.as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let invoice: Value = response.json().await.unwrap();
+    assert_eq!(invoice["currency"], "eur");
+
+    // A customer without a currency falls back to usd.
+    let response = post_invoice(&server, &key, &[("customer", plain_customer.as_str())]).await;
+    assert_eq!(response.status(), 200);
+    let invoice: Value = response.json().await.unwrap();
+    assert_eq!(invoice["currency"], "usd");
+}
+
+#[tokio::test]
+async fn a_draft_invoice_can_be_deleted() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 2000).await;
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    let response = server
+        .client
+        .delete(server.url(&format!("/v1/invoices/{id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let deleted: Value = response.json().await.unwrap();
+    assert_eq!(deleted["id"], id.as_str());
+    assert_eq!(deleted["object"], "invoice");
+    assert_eq!(deleted["deleted"], true);
+
+    // It is gone: no longer readable and no longer listed.
+    let response = server
+        .client
+        .get(server.url(&format!("/v1/invoices/{id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    let list: Value = server
+        .client
+        .get(server.url("/v1/invoices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
+    assert!(!ids.contains(&id.as_str()), "{ids:?}");
+
+    // Deleting it again is rejected.
+    let response = server
+        .client
+        .delete(server.url(&format!("/v1/invoices/{id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+}
+
+#[tokio::test]
+async fn an_invoice_that_is_not_a_draft_cannot_be_deleted() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 2000).await;
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    server
+        .client
+        .post(server.url(&format!("/v1/invoices/{id}/finalize")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .delete(server.url(&format!("/v1/invoices/{id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // The invoice is untouched.
+    let invoice = get_invoice(&server, &key, &id).await;
+    assert_eq!(invoice["status"], "open");
+}
+
+#[tokio::test]
+async fn deleting_an_invoice_emits_an_invoice_deleted_event() {
+    let receiver = spawn_receiver().await;
+    let server = spawn_with_receiver(Some(receiver.url.clone())).await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 2000).await;
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    server
+        .client
+        .delete(server.url(&format!("/v1/invoices/{id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+
+    flush(&server).await;
+    let types = received_types(&receiver).await;
+    assert!(types.contains(&"invoice.deleted".to_string()), "{types:?}");
+
+    let state = receiver.state.lock().await;
+    let deleted = state
+        .received
+        .iter()
+        .find(|d| d.body["type"] == "invoice.deleted")
+        .unwrap();
+    assert_eq!(deleted.body["data"]["object"]["id"], id);
+}
+
+#[tokio::test]
+async fn a_customer_carries_its_currency() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+
+    let customer: Value = server
+        .client
+        .post(server.url("/v1/customers"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[("email", "eu@example.com"), ("currency", "eur")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(customer["currency"], "eur");
+
+    // The currency can be changed afterwards.
+    let id = customer["id"].as_str().unwrap().to_string();
+    let customer: Value = server
+        .client
+        .post(server.url(&format!("/v1/customers/{id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[("currency", "gbp")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(customer["currency"], "gbp");
+}

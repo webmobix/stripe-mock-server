@@ -2,7 +2,9 @@
 
 ## Purpose
 
-TBD - created by archiving change unify-event-destinations. Update Purpose after archive.
+Models webhooks as a single concept — event destinations — that each declare a
+payload format, an account scope, and an event filter, and that are the only
+place a webhook URL and its signing secret are configured.
 
 ## Requirements
 
@@ -12,19 +14,12 @@ The server SHALL model webhooks exclusively as event destinations. The TOML
 configuration SHALL accept `[[event_destinations]]` and SHALL NOT accept
 `[[webhook_targets]]`; each destination declares a `name`, an `event_payload` of
 `snapshot` or `thin`, an `events_from` list, an `enabled_events` list, an
-`enabled` flag, and a `webhook_endpoint.url`, and the server SHALL generate a
-`whsec_` signing secret per endpoint URL and persist it across restarts. Every
-destination with the same `webhook_endpoint.url` SHALL report the same secret.
+`enabled` flag, and a `webhook_endpoint.url`.
 
 #### Scenario: Config destination is seeded
 
 - **WHEN** the configuration declares an event destination and the server starts
-- **THEN** the destination exists, is owned by the platform account, and has a `whsec_` secret for its URL
-
-#### Scenario: Restart is idempotent
-
-- **WHEN** the server restarts with the same `[[event_destinations]]` name
-- **THEN** the existing destination is updated in place and its secret is unchanged
+- **THEN** the destination exists and is owned by the platform account
 
 #### Scenario: Invalid config fails at boot
 
@@ -32,16 +27,29 @@ destination with the same `webhook_endpoint.url` SHALL report the same secret.
   other than `snapshot`/`thin`, or a `type` other than `webhook_endpoint`
 - **THEN** configuration parsing fails with a descriptive error
 
+### Requirement: Signing secret is issued per endpoint URL
+
+The server SHALL generate a `whsec_` signing secret per endpoint URL and persist
+it across restarts. Every destination with the same `webhook_endpoint.url` SHALL
+report the same secret.
+
+#### Scenario: Restart is idempotent
+
+- **WHEN** the server restarts with the same `[[event_destinations]]` name
+- **THEN** the existing destination is kept rather than re-created, and its secret is unchanged
+
+#### Scenario: Destinations sharing a URL share one secret
+
+- **WHEN** two destinations declare the same `webhook_endpoint.url`
+- **THEN** both report the same `whsec_` secret
+
 ### Requirement: Payload format selects the delivered payload shape
 
 A destination SHALL have exactly one payload format, independent of the event
 family (v1 vs v2). A `snapshot` destination SHALL receive `event` objects; a
 `thin` destination SHALL receive `v2.core.event` notifications. A single
 destination SHALL NOT receive the same event in both formats, and a snapshot
-destination SHALL NOT receive thin events (nor vice versa). Selection of *which*
-events reach a destination is governed by `enabled_events` and `events_from`,
-not by the payload format; a thin destination can therefore receive both
-v1-derived (`v1.*`) and v2-derived (`v2.core.*`) event types.
+destination SHALL NOT receive thin events (nor vice versa).
 
 #### Scenario: Snapshot destination receives v1 events
 
@@ -53,16 +61,23 @@ v1-derived (`v1.*`) and v2-derived (`v2.core.*`) event types.
 - **WHEN** a `v2.core.account.*` event is emitted
 - **THEN** it is delivered to matching `event_payload = "thin"` destinations only
 
+#### Scenario: Two destinations for both formats
+
+- **WHEN** a snapshot and a thin destination both point at a receiver
+- **THEN** the receiver gets the event in both formats
+
+### Requirement: Payload format does not select the event family
+
+Selection of *which* events reach a destination SHALL be governed by
+`enabled_events` and `events_from`, not by the payload format; a thin
+destination can therefore receive both v1-derived (`v1.*`) and v2-derived
+(`v2.core.*`) event types.
+
 #### Scenario: One thin destination receives both event families
 
 - **WHEN** a thin destination is configured with `events_from = ["@self", "@accounts"]` and `enabled_events = ["*"]`
 - **AND** a v2 Account change emits `v1.account.updated` and `v2.core.account.updated`
 - **THEN** that single destination receives both thin notifications
-
-#### Scenario: Two destinations for both formats
-
-- **WHEN** a snapshot and a thin destination both point at a receiver
-- **THEN** the receiver gets the event in both formats
 
 ### Requirement: Account scope via `events_from`
 

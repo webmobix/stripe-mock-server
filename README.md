@@ -2,8 +2,8 @@
 
 A local, stateful **Stripe-compatible server** for automated tests. Point the
 official Stripe SDK at it (via a base-URL override) and run Connect onboarding,
-catalog, billing, checkout, and webhook flows deterministically — no Stripe
-account, network, or dashboard required.
+catalog, billing, invoicing, checkout, and webhook flows deterministically — no
+Stripe account, network, or dashboard required.
 
 The server is a single Rust process backed by a SQLite file. It implements a
 focused subset of the API across two conventions:
@@ -13,8 +13,9 @@ focused subset of the API across two conventions:
   distinct error envelope.
 
 Object identifiers use real Stripe prefixes (`acct_`, `prod_`, `price_`, `cus_`,
-`sub_`, `cs_test_`, `pi_`, `evt_`, `sk_test_`, `pk_test_`, `whsec_`), and state
-changes create events synchronously while webhook delivery stays asynchronous.
+`txi_`, `in_`, `txr_`, `sub_`, `cs_test_`, `pi_`, `evt_`, `sk_test_`, `pk_test_`,
+`whsec_`), and state changes create events synchronously while webhook delivery
+stays asynchronous.
 
 > **This is a test tool.** It intentionally exposes generated secrets and
 > never talks to real payment networks. Do not run it in production or on a
@@ -56,11 +57,18 @@ email = "owner@example.com"
 name = "Mock Platform"
 
 [[event_destinations]]
-name = "snapshot-app"
+name = "platform-app"
 event_payload = "snapshot"          # snapshot (v1) | thin (v2)
 events_from = ["@self", "@accounts"] # your account | connected accounts
 enabled_events = ["*"]              # or exact names / "prefix.*"
 webhook_endpoint = { url = "http://localhost:4000/stripe/webhook" }
+
+[[event_destinations]]
+name = "thin-app"
+event_payload = "thin"
+events_from = ["@self"]
+enabled_events = ["v2.core.account.*"]
+webhook_endpoint = { url = "http://localhost:4002/stripe/thin" }
 ```
 
 Every field is documented in [`docs/configuration.md`](docs/configuration.md).
@@ -132,13 +140,13 @@ single receiver verifies snapshot and thin deliveries alike with one value.
 ```bash
 curl -s http://127.0.0.1:12111/internal/destinations | jq
 # { "object": "list", "data": [
-#   { "id": "ed_test_...", "name": "snapshot-app",
+#   { "id": "ed_test_...", "name": "platform-app",
 #     "event_payload": "snapshot", "status": "enabled",
 #     "webhook_endpoint": { "url": "...", "signing_secret": "whsec_..." } } ] }
 
 # Grab one destination's secret by name:
 WHSEC=$(curl -s http://127.0.0.1:12111/internal/destinations \
-  | jq -r '.data[] | select(.name=="snapshot-app") | .webhook_endpoint.signing_secret')
+  | jq -r '.data[] | select(.name=="platform-app") | .webhook_endpoint.signing_secret')
 ```
 
 Secrets are keyed by endpoint URL and persisted, so they stay stable across
@@ -242,9 +250,9 @@ const stripe = new Stripe(process.env.SECRET_KEY, {
 ```
 
 A complete SDK-driven flow (v2 account + onboarding → product/price →
-customer → subscription → checkout → mock payment → verified webhook
-deliveries for both snapshot and thin destinations) lives in
-[`scripts/sdk-e2e/`](scripts/sdk-e2e/). Run it with:
+customer → subscription → checkout → mock payment → customer with tax id →
+invoice → finalize → pay → verified webhook deliveries for both snapshot and
+thin destinations) lives in [`scripts/sdk-e2e/`](scripts/sdk-e2e/). Run it with:
 
 ```bash
 cd scripts/sdk-e2e
@@ -253,19 +261,21 @@ npm install
 ```
 
 The script verifies snapshot and connected-scope webhook signatures with
-`stripe.webhooks.constructEvent` using each destination's `whsec_` secret, and
-creates a v2 event destination and verifies a `v2.core.account.created` thin
-event with `stripe.parseEventNotification`, then retrieves it with
-`stripe.v2.core.events.retrieve`. It has been run successfully against this
-build; the recorded result is `E2E_SDK_OK`.
+`stripe.webhooks.constructEvent` using each destination's `whsec_` secret,
+including the `invoice.paid` event from the invoice flow, and creates a v2 event
+destination and verifies a `v2.core.account.created` thin event with
+`stripe.parseEventNotification`, then retrieves it with
+`stripe.v2.core.events.retrieve`. It also settles a second invoice partially
+through `POST /internal/payment_intents/{id}/resolve` and asserts the invoice
+stays `open` with the remaining balance. It has been run successfully against
+this build; the recorded result is `E2E_SDK_OK`.
 
 ## Testing
 
 ```bash
-cargo test          # unit + integration tests
-openspec validate build-stripe-mock
-openspec validate add-v2-thin-events
-openspec validate unify-event-destinations
+cargo test                 # unit + integration tests
+openspec validate --all    # every spec (and any open change)
+openspec validate --archived  # archived changes have all tasks completed
 ```
 
 The integration tests boot the server on an ephemeral port with a fresh temp
@@ -277,13 +287,16 @@ database and drive it over HTTP, including asynchronous webhook delivery.
 requests targeting `main`:
 
 1. **Test** - `cargo test --locked`.
-2. **Docker** - builds a multi-arch image (`linux/amd64` and `linux/arm64`) on
+2. **Validate OpenSpec** - `openspec validate --all --strict` and
+   `openspec validate --archived`, so a spec that drifts out of shape fails the
+   build instead of accumulating warnings.
+3. **Docker** - builds a multi-arch image (`linux/amd64` and `linux/arm64`) on
    native runners (no QEMU emulation) and pushes it to Docker Hub. Each
    architecture is built and pushed by digest, then a merge job stitches the
    digests into one manifest list. It only runs for pushes (not pull requests)
-   and `needs` the test job, so untested code is never published. On `main` the
-   image is tagged `latest`, `main`, and `sha-<short>`; pushing a `v*.*.*` tag
-   also publishes `X.Y.Z` and `X.Y` tags.
+   and `needs` the test and spec-validation jobs, so untested code is never
+   published. On `main` the image is tagged `latest`, `main`, and `sha-<short>`;
+   pushing a `v*.*.*` tag also publishes `X.Y.Z` and `X.Y` tags.
 
 Configure these under **Settings → Secrets and variables → Actions**:
 
@@ -317,7 +330,8 @@ server-side time advance / billing renewals, full v2 onboarding
 (`account_tokens` + `persons`), a hosted invoice page, `/v1/tax_rates`,
 `invoiceitems`, idempotency keys, concurrent
 per-event delivery, and endpoints beyond the implemented subset. See
-`openspec/changes/build-stripe-mock/design.md` for the deferred list.
+`openspec/changes/archive/2026-10-09-build-stripe-mock/design.md` for the
+deferred list.
 
 ## License
 

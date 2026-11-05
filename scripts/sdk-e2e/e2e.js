@@ -143,6 +143,119 @@ const postForm = (url, params) =>
   if (paid.status !== 'paid') throw new Error('invoice not paid');
   if (paid.amount_remaining !== 0) throw new Error('invoice balance left');
 
+  // --- SDK 22.6+ flow: create the invoice empty, then add its lines ---------
+  const empty = await stripe.invoices.create({ customer: taxCustomer.id });
+  console.log(
+    'empty invoice',
+    empty.id,
+    empty.status,
+    empty.currency,
+    empty.subtotal,
+    empty.tax_total,
+    empty.total,
+    empty.lines.data.length,
+  );
+  if (empty.status !== 'draft') throw new Error('empty invoice not draft');
+  if (empty.lines.data.length !== 0) throw new Error('empty invoice carries lines');
+  if (empty.subtotal !== 0 || empty.tax_total !== 0 || empty.total !== 0) {
+    throw new Error('empty invoice is not zero');
+  }
+
+  const withLines = await stripe.invoices.addLines(empty.id, {
+    lines: [{ price: mainPrice.id, quantity: 2, tax_rate: { percentage: 10, name: 'VAT' } }],
+  });
+  console.log('invoice after addLines', withLines.status, withLines.subtotal, withLines.tax_total, withLines.total);
+  if (withLines.lines.data.length !== 1) throw new Error('line not added');
+  if (withLines.subtotal !== 1000) throw new Error('bad subtotal after addLines');
+  if (withLines.tax_total !== 100) throw new Error('bad tax total after addLines');
+  if (withLines.total !== 1100) throw new Error('bad total after addLines');
+
+  const emptyFinalized = await stripe.invoices.finalizeInvoice(empty.id);
+  console.log('empty invoice finalized', emptyFinalized.status, emptyFinalized.amount_due);
+  if (emptyFinalized.status !== 'open') throw new Error('invoice not open');
+  if (emptyFinalized.amount_due !== 1100) throw new Error('bad amount due');
+
+  const emptyPaid = await stripe.invoices.pay(empty.id);
+  console.log('empty invoice paid', emptyPaid.status, emptyPaid.amount_paid, emptyPaid.amount_remaining);
+  if (emptyPaid.status !== 'paid') throw new Error('invoice not paid');
+  if (emptyPaid.amount_remaining !== 0) throw new Error('invoice balance left');
+
+  // --- an invoice with no lines cannot be finalized -------------------------
+  const bare = await stripe.invoices.create({ customer: taxCustomer.id });
+  let finalizeError = null;
+  try {
+    await stripe.invoices.finalizeInvoice(bare.id);
+  } catch (e) {
+    finalizeError = e;
+  }
+  if (!finalizeError) throw new Error('finalizing an empty invoice was accepted');
+  console.log('finalize without lines rejected', finalizeError.code ?? finalizeError.message);
+  const stillDraft = await stripe.invoices.retrieve(bare.id);
+  if (stillDraft.status !== 'draft') throw new Error('invoice left the draft state');
+
+  // --- delete a draft invoice ------------------------------------------------
+  const toDelete = await stripe.invoices.create({ customer: taxCustomer.id });
+  const deleted = await stripe.invoices.del(toDelete.id);
+  console.log('deleted invoice', deleted.id, deleted.object, deleted.deleted);
+  if (deleted.deleted !== true) throw new Error('invoice not deleted');
+  if (deleted.object !== 'invoice') throw new Error('bad tombstone object');
+
+  let missing = null;
+  try {
+    await stripe.invoices.retrieve(toDelete.id);
+  } catch (e) {
+    missing = e;
+  }
+  if (!missing) throw new Error('deleted invoice still readable');
+  console.log('deleted invoice is gone', missing.statusCode ?? missing.code);
+
+  const list = await stripe.invoices.list({ customer: taxCustomer.id });
+  if (list.data.some((i) => i.id === toDelete.id)) throw new Error('deleted invoice still listed');
+
+  // --- the invoice currency --------------------------------------------------
+  const eurCustomer = await stripe.customers.create({
+    email: 'eur@example.com',
+    name: 'EUR Buyer',
+    currency: 'eur',
+  });
+  if (eurCustomer.currency !== 'eur') throw new Error('customer currency missing');
+  console.log('customer currency', eurCustomer.currency);
+
+  const eurProduct = await stripe.products.create({ name: 'EUR Plan' });
+  const eurPrice = await stripe.prices.create({
+    product: eurProduct.id,
+    unit_amount: 1200,
+    currency: 'eur',
+  });
+
+  // The currency of the request wins.
+  const eurInvoice = await stripe.invoices.create({
+    customer: eurCustomer.id,
+    currency: 'eur',
+  });
+  if (eurInvoice.currency !== 'eur') throw new Error('bad invoice currency');
+  const eurLine = await stripe.invoices.addLines(eurInvoice.id, {
+    lines: [{ price: eurPrice.id, quantity: 1 }],
+  });
+  console.log('eur invoice', eurInvoice.id, eurInvoice.currency, eurLine.total);
+  if (eurLine.currency !== 'eur') throw new Error('bad invoice currency');
+  if (eurLine.total !== 1200) throw new Error('bad eur total');
+
+  // Without one, the currency of the customer is used.
+  const inherited = await stripe.invoices.create({ customer: eurCustomer.id });
+  console.log('inherited currency', inherited.currency);
+  if (inherited.currency !== 'eur') throw new Error('currency not inherited from the customer');
+
+  // A price in another currency is rejected.
+  let currencyError = null;
+  try {
+    await stripe.invoices.addLines(inherited.id, { lines: [{ price: mainPrice.id, quantity: 1 }] });
+  } catch (e) {
+    currencyError = e;
+  }
+  if (!currencyError) throw new Error('a price in another currency was accepted');
+  console.log('foreign price rejected', currencyError.code ?? currencyError.message);
+
   // --- settle a second invoice through the control plane --------------------
   const second = await stripe.invoices.create({
     customer: taxCustomer.id,
@@ -194,6 +307,10 @@ const postForm = (url, params) =>
   if (!invoiceEvent) throw new Error('no invoice.paid event received');
   const invoiceVerified = stripe.webhooks.constructEvent(invoiceEvent.body, invoiceEvent.sig, secrets['platform-app']);
   console.log('verified invoice webhook', invoiceVerified.id, invoiceVerified.type);
+
+  const deletedEvent = platformReceiver.received.find((r) => r.type === 'invoice.deleted');
+  if (!deletedEvent) throw new Error('no invoice.deleted event received');
+  console.log('received invoice.deleted', deletedEvent.type);
 
   const connectedVerified = stripe.webhooks.constructEvent(connectedEvent.body, connectedEvent.sig, secrets['connected-app']);
   const platformVerified = stripe.webhooks.constructEvent(platformEvent.body, platformEvent.sig, secrets['platform-app']);

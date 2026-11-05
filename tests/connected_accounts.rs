@@ -62,11 +62,7 @@ async fn seed_returns_id_and_keys_without_auth() {
 async fn active_and_pending_states_and_distinct_ids() {
     let server = spawn().await;
 
-    let (_, active) = seed(
-        &server,
-        json!({ "name": "Active Co", "state": "active" }),
-    )
-    .await;
+    let (_, active) = seed(&server, json!({ "name": "Active Co", "state": "active" })).await;
     assert_eq!(active["details_submitted"], true);
     assert_eq!(active["charges_enabled"], true);
     assert_eq!(active["payouts_enabled"], true);

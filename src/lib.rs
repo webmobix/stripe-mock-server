@@ -125,7 +125,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/invoices",
             post(api::invoicing::create_invoice).get(api::invoicing::list_invoices),
         )
-        .route("/v1/invoices/{id}", get(api::invoicing::get_invoice))
+        .route(
+            "/v1/invoices/{id}",
+            get(api::invoicing::get_invoice).delete(api::invoicing::delete_invoice),
+        )
         .route(
             "/v1/invoices/{id}/lines",
             get(api::invoicing::get_invoice_lines),

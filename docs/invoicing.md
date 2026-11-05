@@ -16,9 +16,11 @@ rejected with an `invalid_request_error` and leaves the invoice unchanged.
 
 ## Create an invoice
 
-An invoice needs a `customer` and at least one line. A line is either priced
-from the catalog (`lines[][price]`, with an optional `lines[][quantity]`) or
-written directly (`lines[][amount]`, with an optional
+An invoice needs a `customer`. Its lines are optional: an invoice may be
+created empty and given its lines afterwards with
+[`add_lines`](#add-lines), which is how the Stripe SDK 22.6 creates one. A
+line is either priced from the catalog (`lines[][price]`, with an optional
+`lines[][quantity]`) or written directly (`lines[][amount]`, with an optional
 `lines[][description]`):
 
 ```bash
@@ -37,8 +39,36 @@ IID=$(echo "$INVOICE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["
 ```
 
 A new invoice has an `in_` id, `status` of `draft`, and the `subtotal`, `total`,
-and `lines` computed from the catalog prices. `quantity` defaults to 1. Every
-line must use the same currency; a mismatch is rejected.
+and `lines` computed from the catalog prices. `quantity` defaults to 1.
+
+An invoice created without any line is an empty draft: its `lines.data` is
+empty and its `subtotal`, `tax_total`, and `total` are 0.
+
+```bash
+curl -s -X POST $BASE/v1/invoices \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode "customer=$CID"
+```
+
+### Currency
+
+The invoice's currency is fixed when the invoice is created and never changes
+afterwards. It is:
+
+1. the `currency` of the request, when the request carries one;
+2. otherwise the currency of the customer the invoice is raised against;
+3. otherwise `usd`.
+
+```bash
+curl -s -X POST $BASE/v1/invoices \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode "customer=$CID" \
+  --data-urlencode "currency=eur"
+```
+
+A `currency` that is not a three-letter ISO code is rejected. A line priced
+from the catalog in another currency than the invoice is rejected too, both at
+creation and on [`add_lines`](#add-lines).
 
 ### Ad-hoc lines
 
@@ -56,7 +86,7 @@ curl -s -X POST $BASE/v1/invoices \
 
 The ad-hoc line form is accepted both at invoice creation and on
 [`add_lines`](#add-lines). A line that carries neither a `price` nor an
-`amount` is rejected, and so is an invoice without any line.
+`amount` is rejected.
 
 ### Tax rates
 
@@ -184,6 +214,29 @@ Paying an invoice creates a payment intent for the outstanding balance and
 settles it as `succeeded`. The response is the invoice, with `payment_intent`
 holding the id of the payment intent that settled it.
 
+Finalizing an invoice that has no line is rejected, because the lines of an
+invoice created empty are only added afterwards.
+
+## Delete an invoice
+
+A draft invoice can be deleted, which is how an application rolls back a draft
+it no longer needs:
+
+```bash
+curl -s -X DELETE $BASE/v1/invoices/$IID -H "Authorization: Bearer $KEY"
+```
+
+The response is a tombstone, as on Stripe:
+
+```json
+{"id": "in_...", "object": "invoice", "deleted": true}
+```
+
+The invoice is removed: it can no longer be read and it is gone from the
+invoice list. An invoice that is not a draft cannot be deleted — a finalized
+invoice has to be voided instead — and the call is rejected with an
+`invalid_request_error`.
+
 ## Payment intents
 
 Payment intents can also be created directly, optionally attached to a
@@ -233,12 +286,14 @@ The customer and invoice flow emits:
 - `customer.created`, `customer.updated`, `customer.deleted`
 - `invoice.created`, `invoice.finalized`, `invoice.paid`,
   `invoice.payment_succeeded`, `invoice.payment_failed`, `invoice.voided`,
-  `invoice.marked_uncollectible`, `invoice.updated`
+  `invoice.marked_uncollectible`, `invoice.updated`, `invoice.deleted`
 - `payment_intent.created`, `payment_intent.succeeded`,
   `payment_intent.payment_failed`, `payment_intent.canceled`
 
 `invoice.updated` is emitted whenever the lines of an invoice are added to,
 removed from, or updated; a rejected change emits nothing.
+
+`invoice.deleted` is emitted when a draft invoice is deleted.
 
 `payment_intent.succeeded` is also emitted by the checkout completion flow, so
 an application can handle one event name for both sources. See

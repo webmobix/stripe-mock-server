@@ -35,13 +35,35 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+  # Keep the OpenSpec specs and archived changes valid, so a spec that drifts
+  # out of shape fails the build instead of accumulating warnings.
+  openspec:
+    name: Validate OpenSpec
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install OpenSpec
+        run: npm install --global @fission-ai/openspec@1.15.0
+
+      - name: Validate specs and changes
+        run: |
+          openspec validate --all --strict
+          openspec validate --archived
+
   # Build each architecture on a native runner (no QEMU emulation) and push it
   # by digest. The merge job below stitches the digests into one multi-arch
   # manifest and applies the real tags.
   docker:
     name: Build image (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    needs: [test]
+    needs: [test, openspec]
     # Publish only for pushes (main and version tags), never for pull requests.
     if: github.event_name == 'push'
     strategy:

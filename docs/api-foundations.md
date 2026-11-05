@@ -77,6 +77,10 @@ v2 (`GET /v2/core/accounts`) additionally returns `next_page_url`.
 | `prod_` | product |
 | `price_` | price |
 | `cus_` | customer |
+| `txi_` | customer tax id |
+| `in_` | invoice |
+| `txr_` | invoice line tax rate |
+| `il_` | invoice line |
 | `sub_` | subscription |
 | `cs_test_` | checkout session |
 | `pi_` | payment intent |

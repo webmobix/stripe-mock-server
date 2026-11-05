@@ -29,6 +29,24 @@ pub(crate) fn metadata_from(params: &Value) -> Value {
     }
 }
 
+/// Read a `currency` parameter and normalize it to a lower-case ISO code.
+///
+/// Absent means `None`, so a caller can tell "not given" from "given as usd".
+pub(crate) fn parse_currency(params: &Value) -> Result<Option<String>, ApiError> {
+    let Some(raw) = get_str(params, &["currency"]) else {
+        return Ok(None);
+    };
+    let currency = raw.trim().to_ascii_lowercase();
+    if currency.len() != 3 || !currency.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Err(ApiError::invalid_param(
+            v1(),
+            "currency",
+            "Invalid currency: must be a three-letter ISO code",
+        ));
+    }
+    Ok(Some(currency))
+}
+
 // ---------------------------------------------------------------------------
 // Accounts
 // ---------------------------------------------------------------------------
@@ -287,6 +305,7 @@ pub async fn create_price(
         return Err(ApiError::invalid_param(v1(), "product", "No such product"));
     }
     let currency = get_str(&params, &["currency"]).unwrap_or_else(|| "usd".to_string());
+    let currency = currency.trim().to_ascii_lowercase();
     if currency.len() != 3 || !currency.chars().all(|c| c.is_ascii_alphabetic()) {
         return Err(ApiError::invalid_param(
             v1(),
@@ -294,7 +313,6 @@ pub async fn create_price(
             "Invalid currency: must be a three-letter ISO code",
         ));
     }
-    let currency = currency.to_ascii_lowercase();
     let unit_amount = match get_str(&params, &["unit_amount"]) {
         None => None,
         Some(raw) => match raw.parse::<i64>() {
@@ -439,14 +457,16 @@ pub async fn create_customer(
     let id = ids::customer_id();
     let now = time::now_epoch();
     let tax_ids = parse_tax_id_data(&params, now)?;
+    let currency = parse_currency(&params)?;
 
     let event_id = {
         let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
-        sqlx::query("INSERT INTO customers (id, account_id, email, name, created, tax_ids, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+        sqlx::query("INSERT INTO customers (id, account_id, email, name, currency, created, tax_ids, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
             .bind(&id)
             .bind(&ctx.account_id)
             .bind(get_str(&params, &["email"]))
             .bind(get_str(&params, &["name"]))
+            .bind(&currency)
             .bind(now)
             .bind(serde_json::to_string(&tax_ids).unwrap_or_else(|_| "[]".to_string()))
             .bind(metadata_from(&params).to_string())
@@ -562,6 +582,8 @@ pub async fn update_customer(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or(existing.name.clone());
+    // The customer's currency only changes when the request names one.
+    let currency = parse_currency(&params)?.or(existing.currency.clone());
     let metadata = match params.get("metadata") {
         Some(_) => metadata_from(&params).to_string(),
         None => existing
@@ -576,10 +598,11 @@ pub async fn update_customer(
     let event_id = {
         let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
         sqlx::query(
-            "UPDATE customers SET email = ?1, name = ?2, metadata = ?3, tax_ids = ?4 WHERE id = ?5",
+            "UPDATE customers SET email = ?1, name = ?2, currency = ?3, metadata = ?4, tax_ids = ?5 WHERE id = ?6",
         )
         .bind(&email)
         .bind(&name)
+        .bind(&currency)
         .bind(&metadata)
         .bind(serde_json::to_string(&tax_ids).unwrap_or_else(|_| "[]".to_string()))
         .bind(&id)

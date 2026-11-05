@@ -2,7 +2,9 @@
 
 ## Purpose
 
-TBD - created by archiving change add-v2-thin-events. Update Purpose after archive.
+Adds Stripe's v2 thin-event model: v2.core.event notifications for Accounts,
+the event destination resource that carries them, and the read API that returns
+the full versioned event behind a notification.
 
 ## Requirements
 
@@ -49,7 +51,7 @@ The server SHALL create a `v2.core.event` with type `v2.core.account.created` in
 
 ### Requirement: Config-declared event destinations
 
-The server SHALL allow event destinations to be declared in the TOML config under `[[event_destinations]]` (`name`, `description`, `type`, `event_payload`, `events_from`, `enabled_events`, `enabled`, and `webhook_endpoint.url`), seeding them at boot with a `whsec_` secret keyed by endpoint URL and updating them idempotently by name on restart. Snapshot and thin destinations are both supported and coexist.
+The server SHALL allow event destinations to be declared in the TOML config under `[[event_destinations]]` (`name`, `description`, `type`, `event_payload`, `events_from`, `enabled_events`, `enabled`, and `webhook_endpoint.url`), seeding them at boot with a `whsec_` secret keyed by endpoint URL and keeping any existing destination with the same name rather than re-creating it. Snapshot and thin destinations are both supported and coexist.
 
 #### Scenario: Config destination is seeded
 
@@ -59,7 +61,7 @@ The server SHALL allow event destinations to be declared in the TOML config unde
 #### Scenario: Restart is idempotent
 
 - **WHEN** the server restarts with the same `[[event_destinations]]` name
-- **THEN** the existing destination is updated in place and its secret is unchanged
+- **THEN** the existing destination is kept rather than re-created, and its secret is unchanged
 
 ### Requirement: Thin events on account updates
 
