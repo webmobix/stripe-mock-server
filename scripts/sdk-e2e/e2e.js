@@ -175,6 +175,26 @@ const postForm = (url, params) =>
   if (emptyFinalized.status !== 'open') throw new Error('invoice not open');
   if (emptyFinalized.amount_due !== 1100) throw new Error('bad amount due');
 
+  // A finalized invoice has a hosted page and a PDF.
+  if (!emptyFinalized.hosted_invoice_url) throw new Error('no hosted invoice url');
+  if (!emptyFinalized.invoice_pdf) throw new Error('no invoice pdf');
+  console.log('hosted invoice', emptyFinalized.hosted_invoice_url);
+  console.log('invoice pdf', emptyFinalized.invoice_pdf);
+
+  const hosted = await fetch(emptyFinalized.hosted_invoice_url);
+  if (hosted.status !== 200) throw new Error(`hosted invoice page returned ${hosted.status}`);
+  const hostedBody = await hosted.text();
+  if (!hostedBody.includes(empty.id)) throw new Error('hosted page does not show the invoice');
+  console.log('hosted invoice page', hosted.status, hosted.headers.get('content-type'));
+
+  const pdf = await fetch(emptyFinalized.invoice_pdf);
+  if (pdf.status !== 200) throw new Error(`invoice pdf returned ${pdf.status}`);
+  const pdfBody = Buffer.from(await pdf.arrayBuffer());
+  if (!pdfBody.subarray(0, 5).toString().startsWith('%PDF')) {
+    throw new Error('invoice pdf is not a pdf');
+  }
+  console.log('invoice pdf', pdf.status, pdf.headers.get('content-type'), pdfBody.length, 'bytes');
+
   const emptyPaid = await stripe.invoices.pay(empty.id);
   console.log('empty invoice paid', emptyPaid.status, emptyPaid.amount_paid, emptyPaid.amount_remaining);
   if (emptyPaid.status !== 'paid') throw new Error('invoice not paid');

@@ -2436,3 +2436,83 @@ async fn an_invoice_can_be_created_with_an_inline_price() {
     assert_eq!(line["description"], "Ad offer");
     assert_eq!(line["price"]["unit_amount"], 1500);
 }
+
+// ---------------------------------------------------------------------------
+// Hosted invoice page
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_finalized_invoice_has_a_hosted_page() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+    let price = create_price(&server, &key, 2000).await;
+    let invoice = create_invoice(&server, &key, &customer, &price).await;
+    let id = invoice["id"].as_str().unwrap().to_string();
+
+    // A draft invoice has no hosted page yet.
+    assert_eq!(invoice["hosted_invoice_url"], Value::Null);
+    assert_eq!(invoice["invoice_pdf"], Value::Null);
+
+    let response = server
+        .client
+        .post(server.url(&format!("/v1/invoices/{id}/finalize")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let invoice: Value = response.json().await.unwrap();
+
+    let hosted = format!("{}/mock/invoices/{id}", server.base_url);
+    assert_eq!(invoice["hosted_invoice_url"], hosted.as_str());
+    assert_eq!(invoice["invoice_pdf"], format!("{hosted}/pdf").as_str());
+
+    // The page is reachable and describes the invoice.
+    let response = server
+        .client
+        .get(server.url(&format!("/mock/invoices/{id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert!(body.contains(&id), "{body}");
+    assert!(body.contains("Amount due"), "{body}");
+
+    // And so is its PDF.
+    let response = server
+        .client
+        .get(server.url(&format!("/mock/invoices/{id}/pdf")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/pdf"
+    );
+    let body = response.bytes().await.unwrap();
+    assert!(body.starts_with(b"%PDF-1.4"), "{:?}", &body[..8]);
+}
+
+#[tokio::test]
+async fn an_unknown_invoice_has_no_hosted_page() {
+    let server = spawn().await;
+
+    let response = server
+        .client
+        .get(server.url("/mock/invoices/in_missing"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    let response = server
+        .client
+        .get(server.url("/mock/invoices/in_missing/pdf"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+}

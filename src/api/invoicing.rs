@@ -814,7 +814,7 @@ pub async fn create_invoice(
             &ctx.account_id,
             ctx.is_connected,
             "invoice.created",
-            invoice.to_json(),
+            invoice.to_json(&st.config.base_url()),
         )
         .await
         .map_err(ApiError::internal)?;
@@ -828,7 +828,7 @@ pub async fn create_invoice(
         .fetch_one(&st.pool)
         .await
         .map_err(ApiError::internal)?;
-    Ok(ok(invoice.to_json()))
+    Ok(ok(invoice.to_json(&st.config.base_url())))
 }
 
 pub async fn get_invoice(
@@ -838,7 +838,7 @@ pub async fn get_invoice(
 ) -> Result<Response, ApiError> {
     let ctx = auth(&st, &headers).await?;
     let invoice = load_invoice(&st, &ctx.account_id, &id).await?;
-    Ok(ok(invoice.to_json()))
+    Ok(ok(invoice.to_json(&st.config.base_url())))
 }
 
 pub async fn list_invoices(
@@ -875,7 +875,10 @@ pub async fn list_invoices(
         get_str(&params, &["ending_before"]),
         |i| i.id.clone(),
     );
-    let data = page.iter().map(|i| i.to_json()).collect();
+    let data = page
+        .iter()
+        .map(|i| i.to_json(&st.config.base_url()))
+        .collect();
     Ok(ok(list_envelope("/v1/invoices", data, has_more)))
 }
 
@@ -938,7 +941,7 @@ pub async fn delete_invoice(
             &ctx.account_id,
             ctx.is_connected,
             "invoice.deleted",
-            invoice.to_json(),
+            invoice.to_json(&st.config.base_url()),
         )
         .await
         .map_err(ApiError::internal)?;
@@ -1016,7 +1019,7 @@ async fn write_invoice_lines(
             &ctx.account_id,
             ctx.is_connected,
             "invoice.updated",
-            invoice.to_json(),
+            invoice.to_json(&st.config.base_url()),
         )
         .await
         .map_err(ApiError::internal)?;
@@ -1060,7 +1063,7 @@ pub async fn add_invoice_lines(
         lines.push(render_item(item, &invoice.currency)?);
     }
     let invoice = write_invoice_lines(&st, &ctx, &invoice, lines, &objects).await?;
-    Ok(ok(invoice.to_json()))
+    Ok(ok(invoice.to_json(&st.config.base_url())))
 }
 
 /// Remove line items from a draft invoice.
@@ -1100,7 +1103,7 @@ pub async fn remove_invoice_lines(
     }
 
     let invoice = write_invoice_lines(&st, &ctx, &invoice, lines, &[]).await?;
-    Ok(ok(invoice.to_json()))
+    Ok(ok(invoice.to_json(&st.config.base_url())))
 }
 
 /// Update line items on a draft invoice.
@@ -1132,7 +1135,7 @@ pub async fn update_invoice_lines(
     }
 
     let invoice = write_invoice_lines(&st, &ctx, &invoice, lines, &[]).await?;
-    Ok(ok(invoice.to_json()))
+    Ok(ok(invoice.to_json(&st.config.base_url())))
 }
 
 /// Apply the updatable fields of a line item to one of an invoice's lines.
@@ -1326,7 +1329,7 @@ async fn transition_invoice(
             &ctx.account_id,
             ctx.is_connected,
             event_type,
-            updated.to_json(),
+            updated.to_json(&st.config.base_url()),
         )
         .await
         .map_err(ApiError::internal)?;
@@ -1354,7 +1357,7 @@ pub async fn finalize_invoice(
         ));
     }
     let invoice = transition_invoice(&st, &ctx, &id, "open", "invoice.finalized").await?;
-    Ok(ok(invoice.to_json()))
+    Ok(ok(invoice.to_json(&st.config.base_url())))
 }
 
 pub async fn void_invoice(
@@ -1364,7 +1367,7 @@ pub async fn void_invoice(
 ) -> Result<Response, ApiError> {
     let ctx = auth(&st, &headers).await?;
     let invoice = transition_invoice(&st, &ctx, &id, "void", "invoice.voided").await?;
-    Ok(ok(invoice.to_json()))
+    Ok(ok(invoice.to_json(&st.config.base_url())))
 }
 
 pub async fn mark_invoice_uncollectible(
@@ -1381,7 +1384,7 @@ pub async fn mark_invoice_uncollectible(
         "invoice.marked_uncollectible",
     )
     .await?;
-    Ok(ok(invoice.to_json()))
+    Ok(ok(invoice.to_json(&st.config.base_url())))
 }
 
 // ---------------------------------------------------------------------------
@@ -1532,6 +1535,7 @@ async fn settle_invoice_payment(
     is_connected: bool,
     invoice: &InvoiceRow,
     amount: i64,
+    base_url: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
     if matches!(invoice.status.as_str(), "paid" | "void" | "uncollectible") {
         return Ok(Vec::new());
@@ -1566,7 +1570,7 @@ async fn settle_invoice_payment(
             account_id,
             is_connected,
             "invoice.payment_succeeded",
-            updated.to_json(),
+            updated.to_json(base_url),
         )
         .await?,
     );
@@ -1577,7 +1581,7 @@ async fn settle_invoice_payment(
                 account_id,
                 is_connected,
                 "invoice.paid",
-                updated.to_json(),
+                updated.to_json(base_url),
             )
             .await?,
         );
@@ -1666,6 +1670,7 @@ pub async fn resolve_payment_intent(
                             is_connected,
                             invoice,
                             updated.amount.unwrap_or(0),
+                            &st.config.base_url(),
                         )
                         .await
                         .map_err(ApiError::internal)?,
@@ -1679,7 +1684,7 @@ pub async fn resolve_payment_intent(
                             account_id,
                             is_connected,
                             invoice_event_type.unwrap_or("invoice.payment_failed"),
-                            invoice.to_json(),
+                            invoice.to_json(&st.config.base_url()),
                         )
                         .await
                         .map_err(ApiError::internal)?,
@@ -1764,7 +1769,7 @@ pub async fn pay_invoice(
     // The response is the invoice, as Stripe returns, with the payment intent
     // it settled as an expandable id.
     let invoice = load_invoice(&st, &ctx.account_id, &id).await?;
-    let mut body = invoice.to_json();
+    let mut body = invoice.to_json(&st.config.base_url());
     if let Some(map) = body.as_object_mut() {
         map.insert("payment_intent".into(), json!(intent.id));
     }

@@ -63,6 +63,21 @@ always show the payment form. (`POST /internal/reset` also restores it.) This id
 is for manual/visual testing — programmatically created sessions keep their
 random `cs_test_...` ids and single-use semantics.
 
+## Hosted invoice page
+
+`GET /mock/invoices/{id}` renders the hosted page of a finalized invoice: its
+id, its status, its lines, and its totals. It is the page the invoice's
+`hosted_invoice_url` points at, so an application that sends its customer to
+that URL lands on a page that describes the invoice.
+
+```
+http://127.0.0.1:12111/mock/invoices/in_...
+```
+
+`GET /mock/invoices/{id}/pdf` serves a minimal one-page PDF with the same
+summary; it is the invoice's `invoice_pdf`. Both are built from the configured
+`public_base_url`, and both answer `404` for an invoice that does not exist.
+
 ## Driving it headlessly
 
 Because the pages are plain HTML forms, any HTTP client works. With `curl`:

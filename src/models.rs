@@ -461,7 +461,7 @@ impl InvoiceRow {
             .unwrap_or_default()
     }
 
-    pub fn to_json(&self) -> Value {
+    pub fn to_json(&self, base_url: &str) -> Value {
         json!({
             "id": self.id,
             "object": "invoice",
@@ -483,7 +483,8 @@ impl InvoiceRow {
             "description": self.description,
             "due_date": self.due_date,
             "finalized_at": self.finalized_at,
-            "hosted_invoice_url": Value::Null,
+            "hosted_invoice_url": self.hosted_invoice_url(base_url),
+            "invoice_pdf": self.invoice_pdf(base_url),
             "lines": list_envelope(
                 &format!("/v1/invoices/{}/lines", self.id),
                 self.line_list(),
@@ -501,6 +502,26 @@ impl InvoiceRow {
             "updated": self.updated,
             "voided_at": self.voided_at,
         })
+    }
+
+    /// The URL of the invoice's hosted page.
+    ///
+    /// Stripe publishes the page once the invoice is finalized, so a draft
+    /// invoice has none.
+    pub fn hosted_invoice_url(&self, base_url: &str) -> Option<String> {
+        if self.status == "draft" {
+            return None;
+        }
+        Some(format!("{base_url}/mock/invoices/{}", self.id))
+    }
+
+    /// The URL of the invoice's PDF, which exists once the invoice is
+    /// finalized.
+    pub fn invoice_pdf(&self, base_url: &str) -> Option<String> {
+        if self.status == "draft" {
+            return None;
+        }
+        Some(format!("{base_url}/mock/invoices/{}/pdf", self.id))
     }
 
     /// The unpaid balance: `amount_due` minus `amount_paid`, never negative.
@@ -810,6 +831,9 @@ mod tests {
         assert_eq!(entry["livemode"], false);
     }
 
+    /// The base url the hosted invoice url is built from.
+    const BASE_URL: &str = "http://127.0.0.1:12111";
+
     fn invoice(amount_due: i64, amount_paid: i64, status: &str) -> InvoiceRow {
         InvoiceRow {
             id: "in_1".into(),
@@ -838,7 +862,7 @@ mod tests {
 
     #[test]
     fn paid_invoice_has_no_remaining_balance() {
-        let json = invoice(1100, 1100, "paid").to_json();
+        let json = invoice(1100, 1100, "paid").to_json(BASE_URL);
         assert_eq!(json["amount_remaining"], 0);
         assert_eq!(json["amount_paid"], 1100);
         assert_eq!(json["paid"], true);
@@ -847,14 +871,14 @@ mod tests {
 
     #[test]
     fn partially_paid_invoice_keeps_the_balance() {
-        let json = invoice(1100, 400, "open").to_json();
+        let json = invoice(1100, 400, "open").to_json(BASE_URL);
         assert_eq!(json["amount_remaining"], 700);
         assert_eq!(json["paid"], false);
     }
 
     #[test]
     fn invoice_renders_lines_as_a_list_envelope() {
-        let json = invoice(1000, 0, "draft").to_json();
+        let json = invoice(1000, 0, "draft").to_json(BASE_URL);
         assert_eq!(json["lines"]["object"], "list");
         assert_eq!(json["lines"]["data"][0]["id"], "il_1");
         assert_eq!(json["lines"]["url"], "/v1/invoices/in_1/lines");

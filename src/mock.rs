@@ -6,7 +6,7 @@ use sqlx::SqlitePool;
 use crate::AppState;
 use crate::api::v1;
 use crate::events;
-use crate::models::{AccountRow, CheckoutSessionRow};
+use crate::models::{AccountRow, CheckoutSessionRow, InvoiceRow};
 use crate::time;
 
 /// Well-known checkout session id that is always available so the mock checkout
@@ -590,6 +590,176 @@ fn internal_error(err: impl std::fmt::Display) -> Response {
         Html(shell("Error", "<div class=\"alert\">Internal error</div>")),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Hosted invoice
+// ---------------------------------------------------------------------------
+
+/// The hosted page of an invoice.
+///
+/// Stripe publishes this page once the invoice is finalized; the mock serves
+/// the same information, so an application that sends its customer to the
+/// `hosted_invoice_url` lands on a page that describes the invoice.
+pub async fn invoice_page(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    let invoice = match load_invoice(&st.pool, &id).await {
+        Ok(Some(invoice)) => invoice,
+        _ => return page_error("This invoice does not exist."),
+    };
+    let currency = invoice.currency.clone();
+    let rows: String = invoice
+        .line_list()
+        .iter()
+        .map(|line| {
+            let description = line
+                .get("description")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Item");
+            let amount = line
+                .get("amount")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
+            format!(
+                r#"<tr><td>{description}</td><td class="text-right">{amount}</td></tr>"#,
+                description = crate::util::html_escape(description),
+                amount = crate::util::html_escape(&format_amount(amount, &currency)),
+            )
+        })
+        .collect();
+    let pdf_href = format!(
+        "/mock/invoices/{}/pdf",
+        crate::util::html_escape(&invoice.id)
+    );
+    let body = format!(
+        r#"<div class="card bg-base-100 shadow">
+  <div class="card-body">
+    <h2 class="card-title">Invoice {id}</h2>
+    <div class="stats shadow my-4">
+      <div class="stat">
+        <div class="stat-title">Amount due</div>
+        <div class="stat-value">{amount_due}</div>
+        <div class="stat-desc">Status: {status}</div>
+      </div>
+    </div>
+    <table class="table">
+      <tbody>{rows}</tbody>
+      <tfoot>
+        <tr><td>Subtotal</td><td class="text-right">{subtotal}</td></tr>
+        <tr><td>Tax</td><td class="text-right">{tax_total}</td></tr>
+        <tr><td>Total</td><td class="text-right">{total}</td></tr>
+      </tfoot>
+    </table>
+    <a class="btn btn-primary" href="{pdf_href}">Download PDF</a>
+  </div>
+</div>"#,
+        id = crate::util::html_escape(&invoice.id),
+        amount_due = crate::util::html_escape(&format_amount(invoice.amount_due, &currency)),
+        status = crate::util::html_escape(&invoice.status),
+        rows = rows,
+        subtotal = crate::util::html_escape(&format_amount(invoice.subtotal, &currency)),
+        tax_total = crate::util::html_escape(&format_amount(invoice.tax_total, &currency)),
+        total = crate::util::html_escape(&format_amount(invoice.total, &currency)),
+        pdf_href = pdf_href,
+    );
+    Html(shell("Invoice", &body)).into_response()
+}
+
+/// The PDF of an invoice.
+///
+/// Stripe links a PDF of every finalized invoice; the mock serves a minimal
+/// one-page document with the invoice's summary.
+pub async fn invoice_pdf_page(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    let invoice = match load_invoice(&st.pool, &id).await {
+        Ok(Some(invoice)) => invoice,
+        _ => return page_error("This invoice does not exist."),
+    };
+    let pdf = invoice_pdf_bytes(&invoice);
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/pdf")],
+        pdf,
+    )
+        .into_response()
+}
+
+/// Load an invoice by id, whatever account owns it.
+async fn load_invoice(pool: &SqlitePool, id: &str) -> Result<Option<InvoiceRow>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM invoices WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Render a minimal one-page PDF with the invoice's summary.
+///
+/// The document is written by hand: a catalog, a page, a font, and the
+/// content stream holding the text.
+fn invoice_pdf_bytes(invoice: &InvoiceRow) -> Vec<u8> {
+    let currency = invoice.currency.clone();
+    let lines = [
+        format!("Invoice {}", invoice.id),
+        format!("Status: {}", invoice.status),
+        format!("Customer: {}", invoice.customer),
+        format!("Subtotal: {}", format_amount(invoice.subtotal, &currency)),
+        format!("Tax: {}", format_amount(invoice.tax_total, &currency)),
+        format!("Total: {}", format_amount(invoice.total, &currency)),
+        format!(
+            "Amount due: {}",
+            format_amount(invoice.amount_due, &currency)
+        ),
+    ];
+    let mut content = String::from("BT /F1 12 Tf 50 780 Td 18 TL\n");
+    for line in lines {
+        content.push_str(&format!("({}) Tj T*\n", escape_pdf_text(&line)));
+    }
+    content.push_str("ET\n");
+
+    let mut document = String::from("%PDF-1.4\n");
+    let mut offsets: Vec<usize> = Vec::new();
+    for object in [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{content}endstream", content.len()),
+    ] {
+        offsets.push(document.len());
+        document.push_str(&format!(
+            "{} 0 obj\n{object}\nendobj\n",
+            offsets.len()
+        ));
+    }
+    let xref = document.len();
+    document.push_str(&format!(
+        "xref\n0 {}\n0000000000 65535 f \n",
+        offsets.len() + 1
+    ));
+    for offset in &offsets {
+        document.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    document.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        offsets.len() + 1
+    ));
+    document.into_bytes()
+}
+
+/// Escape the characters that end a PDF text string.
+fn escape_pdf_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '(' | ')' | '\\' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            character if character.is_ascii() => escaped.push(character),
+            // Anything outside ASCII is written as a placeholder, so the
+            // document stays a valid single-byte PDF.
+            _ => escaped.push('?'),
+        }
+    }
+    escaped
 }
 
 /// Format a minor-unit amount using the currency's number of decimals.

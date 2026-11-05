@@ -233,6 +233,8 @@ pub fn build_router(state: AppState) -> Router {
             get(mock::checkout_page).post(mock::checkout_submit),
         )
         .route("/mock/checkout/{id}/cancel", get(mock::checkout_cancel))
+        .route("/mock/invoices/{id}", get(mock::invoice_page))
+        .route("/mock/invoices/{id}/pdf", get(mock::invoice_pdf_page))
         // Internal control plane
         .route("/internal/main", get(internal::main_account))
         .route(

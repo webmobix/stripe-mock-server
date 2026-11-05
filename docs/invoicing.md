@@ -326,10 +326,31 @@ removed from, or updated; a rejected change emits nothing.
 an application can handle one event name for both sources. See
 [`webhooks.md`](webhooks.md) for delivery, signing, and filtering.
 
+## The hosted invoice page
+
+Once an invoice is finalized it has a `hosted_invoice_url` and an
+`invoice_pdf`, both built from the configured `public_base_url`:
+
+```json
+{
+  "hosted_invoice_url": "http://127.0.0.1:12111/mock/invoices/in_...",
+  "invoice_pdf": "http://127.0.0.1:12111/mock/invoices/in_.../pdf"
+}
+```
+
+The page describes the invoice — its status, its lines, and its totals — and
+the PDF holds the same summary:
+
+```bash
+curl -s "$BASE/mock/invoices/$IID"
+curl -s "$BASE/mock/invoices/$IID/pdf" -o invoice.pdf
+```
+
+A draft invoice has neither, as on Stripe: the page is published when the
+invoice is finalized.
+
 ## Not supported
 
-- No hosted invoice page and no `hosted_invoice_url`; invoices are read and
-  driven through the API and the control plane.
 - No `/v1/tax_rates` resource — tax rates are given inline on a line.
 - No `/v1/invoiceitems`; the lines live on the invoice itself and can be
   added, removed, and updated while it is a draft.
