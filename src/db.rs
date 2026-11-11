@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS prices (
     nickname TEXT,
     active INTEGER NOT NULL DEFAULT 1,
     created INTEGER NOT NULL,
-    metadata TEXT
+    metadata TEXT,
+    lookup_key TEXT
 );
 
 CREATE TABLE IF NOT EXISTS customers (
@@ -131,13 +132,60 @@ CREATE TABLE IF NOT EXISTS checkout_sessions (
     cancel_url TEXT,
     customer TEXT,
     customer_account TEXT,
+    customer_email TEXT,
     line_items TEXT NOT NULL,
     payment_intent TEXT,
     subscription TEXT,
+    amount_subtotal INTEGER,
     amount_total INTEGER,
+    amount_discount INTEGER,
+    amount_tax INTEGER,
+    discounts TEXT,
     currency TEXT,
     url TEXT,
     metadata TEXT
+);
+
+CREATE TABLE IF NOT EXISTS coupons (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    percent_off REAL,
+    amount_off INTEGER,
+    currency TEXT,
+    duration TEXT NOT NULL DEFAULT 'once',
+    duration_in_months INTEGER,
+    max_redemptions INTEGER,
+    times_redeemed INTEGER NOT NULL DEFAULT 0,
+    redeem_by INTEGER,
+    name TEXT,
+    applies_to TEXT NOT NULL DEFAULT '{}',
+    metadata TEXT,
+    created INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tax_rates (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    display_name TEXT NOT NULL,
+    percentage REAL NOT NULL,
+    inclusive INTEGER NOT NULL,
+    country TEXT,
+    state TEXT,
+    jurisdiction TEXT,
+    description TEXT,
+    tax_type TEXT,
+    metadata TEXT,
+    created INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS billing_portal_sessions (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    customer TEXT NOT NULL,
+    return_url TEXT NOT NULL,
+    url TEXT NOT NULL,
+    created INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS payment_intents (
@@ -215,6 +263,9 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status);
 CREATE INDEX IF NOT EXISTS idx_keys_account ON api_keys(account_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_account ON invoices(account_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer);
+CREATE INDEX IF NOT EXISTS idx_coupons_account ON coupons(account_id);
+CREATE INDEX IF NOT EXISTS idx_tax_rates_account ON tax_rates(account_id);
+CREATE INDEX IF NOT EXISTS idx_billing_portal_sessions_account ON billing_portal_sessions(account_id);
 "#;
 
 pub async fn connect(path: &str) -> Result<SqlitePool, sqlx::Error> {
@@ -278,6 +329,18 @@ async fn migrate_legacy_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // Column added for the customer's default currency, which an invoice falls
     // back to when the request does not name one.
     add_column_if_missing(pool, "customers", "currency", "TEXT").await?;
+    // Price lookup keys and the checkout customer email and total breakdown
+    // columns were added after the initial schema.
+    add_column_if_missing(pool, "prices", "lookup_key", "TEXT").await?;
+    for (column, decl) in [
+        ("customer_email", "TEXT"),
+        ("amount_subtotal", "INTEGER"),
+        ("amount_discount", "INTEGER"),
+        ("amount_tax", "INTEGER"),
+        ("discounts", "TEXT"),
+    ] {
+        add_column_if_missing(pool, "checkout_sessions", column, decl).await?;
+    }
     Ok(())
 }
 
@@ -319,8 +382,11 @@ pub async fn reset_state(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "events",
         "payment_intents",
         "checkout_sessions",
+        "billing_portal_sessions",
         "invoices",
         "subscriptions",
+        "coupons",
+        "tax_rates",
         "customers",
         "prices",
         "products",
@@ -373,6 +439,26 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // Simulate the price and checkout tables created before lookup keys and
+        // the checkout total columns existed.
+        sqlx::query(
+            "CREATE TABLE prices (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, product_id TEXT NOT NULL, \
+             currency TEXT NOT NULL, unit_amount INTEGER, price_type TEXT NOT NULL, recurring_interval TEXT, \
+             recurring_interval_count INTEGER, nickname TEXT, active INTEGER NOT NULL DEFAULT 1, \
+             created INTEGER NOT NULL, metadata TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE checkout_sessions (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, mode TEXT NOT NULL, \
+             status TEXT NOT NULL, created INTEGER NOT NULL, expires_at INTEGER NOT NULL, success_url TEXT, \
+             cancel_url TEXT, customer TEXT, customer_account TEXT, line_items TEXT NOT NULL, \
+             payment_intent TEXT, subscription TEXT, amount_total INTEGER, currency TEXT, url TEXT, metadata TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         migrate(&pool).await.unwrap();
 
@@ -382,6 +468,19 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(has_column(&pool, "prices", "lookup_key").await.unwrap());
+        for column in [
+            "customer_email",
+            "amount_subtotal",
+            "amount_discount",
+            "amount_tax",
+            "discounts",
+        ] {
+            assert!(
+                has_column(&pool, "checkout_sessions", column).await.unwrap(),
+                "checkout_sessions.{column} was not added"
+            );
+        }
         // The new tables exist and are usable.
         sqlx::query(
             "INSERT INTO customers (id, account_id, created, tax_ids) VALUES ('cus_1', 'acct_1', 0, '[]')",
@@ -396,6 +495,43 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_state_clears_new_tables() {
+        let pool = connect_in_memory().await.unwrap();
+        migrate(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO coupons (id, account_id, duration, applies_to, created) \
+             VALUES ('coupon_1', 'acct_1', 'once', '{}', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tax_rates (id, account_id, display_name, percentage, inclusive, created) \
+             VALUES ('txr_1', 'acct_1', 'VAT', 20, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO billing_portal_sessions (id, account_id, customer, return_url, url, created) \
+             VALUES ('bps_1', 'acct_1', 'cus_1', 'https://example.com', 'https://example.com', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        reset_state(&pool).await.unwrap();
+
+        for table in ["coupons", "tax_rates", "billing_portal_sessions"] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "{table} was not cleared");
+        }
     }
 
     #[tokio::test]

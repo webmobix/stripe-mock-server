@@ -1,3 +1,4 @@
+pub mod expand;
 pub mod invoicing;
 pub mod v1;
 pub mod v2;
@@ -76,10 +77,10 @@ pub fn parse_query_pairs(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Collect repeated `include`/`include[]` query values.
-/// `include`, `include[]`, or the indexed form `include[0]` that stripe-node emits.
-fn is_include_key(key: &str) -> bool {
-    match key.strip_prefix("include") {
+/// Whether `key` names the repeated list parameter `name`: `name`, `name[]`,
+/// or the indexed form `name[0]` that stripe-node emits.
+fn is_list_param_key(key: &str, name: &str) -> bool {
+    match key.strip_prefix(name) {
         Some("") | Some("[]") => true,
         Some(rest) => rest
             .strip_prefix('[')
@@ -89,13 +90,73 @@ fn is_include_key(key: &str) -> bool {
     }
 }
 
+/// Collect repeated query values for `name`, accepting `name`, `name[]`,
+/// indexed `name[0]`, and comma-separated values.
+pub fn collect_list_param(query: &str, name: &str) -> Vec<String> {
+    let mut plain = Vec::new();
+    let mut indexed = Vec::new();
+    for (k, v) in parse_query_pairs(query) {
+        if !is_list_param_key(&k, name) {
+            continue;
+        }
+        let index = k
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('['))
+            .and_then(|rest| rest.strip_suffix(']'))
+            .and_then(|idx| idx.parse::<usize>().ok());
+        for part in v.split(',').filter(|part| !part.is_empty()) {
+            match index {
+                Some(i) => indexed.push((i, part.to_string())),
+                None => plain.push(part.to_string()),
+            }
+        }
+    }
+    indexed.sort_by_key(|(i, _)| *i);
+    plain.extend(indexed.into_iter().map(|(_, v)| v));
+    plain
+}
+
+/// Collect repeated `include`/`include[]` query values.
 pub fn collect_includes(query: &str) -> Vec<String> {
-    parse_query_pairs(query)
-        .into_iter()
-        .filter(|(k, _)| is_include_key(k))
-        .flat_map(|(_, v)| v.split(',').map(str::to_string).collect::<Vec<_>>())
-        .filter(|s| !s.is_empty())
-        .collect()
+    collect_list_param(query, "include")
+}
+
+/// Collect repeated `expand`/`expand[]`/`expand[0]` values from a parsed form
+/// body, including comma-separated values.
+pub fn collect_form_list(value: &Value, name: &str) -> Vec<String> {
+    let Some(field) = value.get(name) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut push = |s: &str| {
+        for part in s.split(',') {
+            if !part.is_empty() {
+                out.push(part.to_string());
+            }
+        }
+    };
+    match field {
+        Value::String(s) => push(s),
+        Value::Array(items) => {
+            for item in items {
+                if let Some(s) = item.as_str() {
+                    push(s);
+                }
+            }
+        }
+        Value::Object(map) => {
+            let mut indexed: Vec<(i64, &str)> = map
+                .iter()
+                .filter_map(|(k, v)| Some((k.parse::<i64>().ok()?, v.as_str()?)))
+                .collect();
+            indexed.sort_by_key(|(index, _)| *index);
+            for (_, s) in indexed {
+                push(s);
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Apply `limit`/`starting_after`/`ending_before` pagination to a newest-first list.
@@ -151,6 +212,55 @@ mod tests {
             includes,
             vec!["identity".to_string(), "requirements".to_string()]
         );
+    }
+
+    #[test]
+    fn collects_every_expand_shape() {
+        for query in [
+            "expand=product",
+            "expand[]=product",
+            "expand[0]=product",
+            "expand[0]=product&expand[1]=price.product",
+            "expand=product,price.product",
+        ] {
+            let expands = collect_list_param(query, "expand");
+            assert!(!expands.is_empty(), "no expand collected from {query}");
+        }
+        assert_eq!(
+            collect_list_param("expand[1]=price.product&expand[0]=product", "expand"),
+            vec!["product".to_string(), "price.product".to_string()]
+        );
+        assert_eq!(
+            collect_list_param("expand=product,customer&expand[]=payment_intent", "expand"),
+            vec![
+                "product".to_string(),
+                "customer".to_string(),
+                "payment_intent".to_string()
+            ]
+        );
+        assert!(collect_list_param("expand[]=&limit=1", "expand").is_empty());
+        assert!(collect_list_param("expandable=x", "expand").is_empty());
+    }
+
+    #[test]
+    fn collects_expands_from_a_parsed_form() {
+        assert_eq!(
+            collect_form_list(&json!({"expand": "product"}), "expand"),
+            vec!["product".to_string()]
+        );
+        assert_eq!(
+            collect_form_list(&json!({"expand": ["product", "customer"]}), "expand"),
+            vec!["product".to_string(), "customer".to_string()]
+        );
+        assert_eq!(
+            collect_form_list(&json!({"expand": {"1": "two", "0": "one"}}), "expand"),
+            vec!["one".to_string(), "two".to_string()]
+        );
+        assert_eq!(
+            collect_form_list(&json!({"expand": "product,price.product"}), "expand"),
+            vec!["product".to_string(), "price.product".to_string()]
+        );
+        assert!(collect_form_list(&json!({"other": "x"}), "expand").is_empty());
     }
 
     #[test]

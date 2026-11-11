@@ -333,6 +333,7 @@ fn parse_price_data_request(item: &Value, price_data: &Value) -> Result<LineRequ
             active: 1,
             created,
             metadata: Some("{}".to_string()),
+            lookup_key: None,
         }
         .to_json(),
         ..price

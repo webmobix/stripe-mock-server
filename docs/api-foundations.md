@@ -69,6 +69,37 @@ newest first, with insertion order as a deterministic tiebreaker.
 
 v2 (`GET /v2/core/accounts`) additionally returns `next_page_url`.
 
+## Response expansion
+
+Endpoints that return expandable references accept repeated `expand[]`
+parameters. Retrieval and list requests read them from the query string;
+create and update requests read them from the form body. Each path is
+dot-separated, traverses every element of an embedded list, and replaces a
+reference id with the full object it names.
+
+Accepted parameter shapes:
+
+| Shape | Example |
+|-------|---------|
+| repeated | `expand[]=product&expand[]=price.product` |
+| bare | `expand=product` |
+| indexed | `expand[0]=product&expand[1]=customer` |
+| comma-separated | `expand=product,price.product` |
+
+Supported reference fields: `product`, `price`, `customer`, `subscription`,
+and `payment_intent`. A field that already holds an object is left as-is.
+Unknown paths, unresolvable ids, and references owned by another account leave
+the original value untouched and raise no error.
+
+```bash
+curl -s "http://127.0.0.1:12111/v1/prices/price_123?expand[]=product" \
+  -H "Authorization: Bearer $STRIPE_SECRET_KEY"
+```
+
+The response's `product` is then the full `product` object instead of its
+`prod_` id. Nested paths include `items.data.price.product` on subscriptions
+and `line_items.data.price.product` on checkout sessions.
+
 ## Prefixed identifiers and keys
 
 | Prefix | Object |
@@ -79,10 +110,12 @@ v2 (`GET /v2/core/accounts`) additionally returns `next_page_url`.
 | `cus_` | customer |
 | `txi_` | customer tax id |
 | `in_` | invoice |
-| `txr_` | invoice line tax rate |
+| `txr_` | tax rate |
 | `il_` | invoice line |
 | `sub_` | subscription |
 | `cs_test_` | checkout session |
+| `coupon_` | coupon |
+| `bps_` | billing portal session |
 | `pi_` | payment intent |
 | `evt_` | event |
 | `sk_test_` | secret API key |

@@ -54,6 +54,14 @@ pub fn checkout_session_id() -> String {
     id("cs_test_")
 }
 
+pub fn coupon_id() -> String {
+    id("coupon_")
+}
+
+pub fn billing_portal_session_id() -> String {
+    id("bps_")
+}
+
 pub fn payment_intent_id() -> String {
     id("pi_")
 }
@@ -116,6 +124,8 @@ mod tests {
         assert!(tax_rate_id().starts_with("txr_"));
         assert!(subscription_id().starts_with("sub_"));
         assert!(checkout_session_id().starts_with("cs_test_"));
+        assert!(coupon_id().starts_with("coupon_"));
+        assert!(billing_portal_session_id().starts_with("bps_"));
         assert!(payment_intent_id().starts_with("pi_"));
         assert!(event_id().starts_with("evt_"));
         assert!(thin_event_id().starts_with("evt_test_"));

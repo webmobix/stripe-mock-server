@@ -1,9 +1,10 @@
 # Hosted simulation UI
 
-The mock serves two server-rendered HTML pages: **onboarding** and **checkout**.
-Both share a set of simulation controls. Pages use Tailwind and daisyUI loaded
-from a CDN and deliberately ship **no client-side framework bundle**, so the same
-pages work headlessly with plain HTTP.
+The mock serves server-rendered HTML pages for **onboarding**, **checkout**,
+**hosted invoices**, and the **billing portal**. They share a set of simulation
+controls. Pages use Tailwind and daisyUI loaded from a CDN and deliberately ship
+**no client-side framework bundle**, so the same pages work headlessly with
+plain HTTP.
 
 ## Onboarding page
 
@@ -77,6 +78,21 @@ http://127.0.0.1:12111/mock/invoices/in_...
 `GET /mock/invoices/{id}/pdf` serves a minimal one-page PDF with the same
 summary; it is the invoice's `invoice_pdf`. Both are built from the configured
 `public_base_url`, and both answer `404` for an invoice that does not exist.
+
+## Billing portal page
+
+`GET /mock/billing-portal/{id}` renders the hosted page of a billing portal
+session. It shows the session's customer and lists that customer's
+subscriptions with their id, status, item quantities, and current period end,
+and links back to the session's `return_url`. A customer with no subscriptions
+renders an empty list. The page is unauthenticated like the other hosted pages.
+
+```
+http://127.0.0.1:12111/mock/billing-portal/bps_...
+```
+
+Create the session with `POST /v1/billing_portal/sessions`; its `url` points at
+this page. An unknown session id renders the mock's not-found page.
 
 ## Driving it headlessly
 

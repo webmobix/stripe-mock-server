@@ -115,6 +115,97 @@ const postForm = (url, params) =>
   await stripe.subscriptions.create({ customer: mainCustomer.id, items: [{ price: mainPrice.id }] });
   console.log('main subscription created');
 
+  // --- lookup keys, expansion, subscription updates, portal, totals -------
+  const lookupProduct = await stripe.products.create({ name: 'E2E Lookup Plan' });
+  const lookupPrice = await stripe.prices.create({
+    product: lookupProduct.id,
+    unit_amount: 1000,
+    currency: 'usd',
+    recurring: { interval: 'month' },
+    lookup_key: 'e2e_pro_monthly',
+  });
+  if (lookupPrice.lookup_key !== 'e2e_pro_monthly') throw new Error('lookup key missing');
+
+  const byLookup = await stripe.prices.list({ lookup_keys: ['e2e_pro_monthly'] });
+  if (byLookup.data.length !== 1 || byLookup.data[0].id !== lookupPrice.id) {
+    throw new Error('lookup key lookup failed');
+  }
+  console.log('price by lookup key', byLookup.data[0].id, byLookup.data[0].lookup_key);
+
+  const expanded = await stripe.prices.retrieve(lookupPrice.id, { expand: ['product'] });
+  if (typeof expanded.product !== 'object' || expanded.product.id !== lookupProduct.id) {
+    throw new Error('price product expansion failed');
+  }
+  console.log('expanded price product', expanded.id, expanded.product.id, expanded.product.object);
+
+  const lookupSubscription = await stripe.subscriptions.create({
+    customer: mainCustomer.id,
+    items: [{ price: lookupPrice.id, quantity: 1 }],
+  });
+  const itemId = lookupSubscription.items.data[0].id;
+  if (!lookupSubscription.items.data[0].current_period_end) {
+    throw new Error('subscription item period missing');
+  }
+  const updatedSubscription = await stripe.subscriptions.update(lookupSubscription.id, {
+    items: [{ id: itemId, quantity: 4 }],
+  });
+  if (updatedSubscription.items.data[0].quantity !== 4) throw new Error('quantity not updated');
+  if (!Array.isArray(updatedSubscription.prorations) || updatedSubscription.prorations.length !== 1) {
+    throw new Error('prorations missing from the update response');
+  }
+  if (updatedSubscription.prorations[0].quantity_delta !== 3) throw new Error('bad quantity delta');
+  console.log(
+    'subscription updated',
+    updatedSubscription.id,
+    updatedSubscription.items.data[0].quantity,
+    updatedSubscription.prorations[0].amount,
+  );
+
+  const portal = await stripe.billingPortal.sessions.create({
+    customer: mainCustomer.id,
+    return_url: 'https://example.com/account',
+  });
+  if (!portal.id.startsWith('bps_')) throw new Error('bad portal id');
+  const portalPage = await fetch(portal.url);
+  if (portalPage.status !== 200) throw new Error(`portal page returned ${portalPage.status}`);
+  const portalHtml = await portalPage.text();
+  if (!portalHtml.includes(mainCustomer.id) || !portalHtml.includes('Return to the application')) {
+    throw new Error('portal page is missing its customer or return link');
+  }
+  console.log('billing portal', portal.id, portal.url, portalPage.status);
+
+  const coupon = await stripe.coupons.create({ percent_off: 25, duration: 'forever' });
+  const taxRate = await stripe.taxRates.create({
+    display_name: 'E2E VAT',
+    inclusive: false,
+    percentage: 10,
+  });
+  const pricedSession = await stripe.checkout.sessions.create({
+    mode: 'payment',
+    customer: mainCustomer.id,
+    line_items: [{ price: lookupPrice.id, quantity: 2 }],
+    discounts: [{ coupon: coupon.id }],
+    tax_rates: [taxRate.id],
+  });
+  console.log(
+    'discounted-taxed session',
+    pricedSession.id,
+    pricedSession.amount_subtotal,
+    pricedSession.amount_discount,
+    pricedSession.amount_tax,
+    pricedSession.amount_total,
+  );
+  if (pricedSession.amount_subtotal !== 2000) throw new Error('bad subtotal');
+  if (pricedSession.amount_discount !== 500) throw new Error('bad discount');
+  if (pricedSession.amount_tax !== 150) throw new Error('bad tax');
+  if (pricedSession.amount_total !== 1650) throw new Error('bad discounted total');
+  await postForm(`${MOCK}/mock/checkout/${pricedSession.id}`, { card: 'success' });
+  const paidSession = await stripe.checkout.sessions.retrieve(pricedSession.id);
+  if (paidSession.amount_total !== 1650) throw new Error('totals changed after completion');
+  const paidIntent = await stripe.paymentIntents.retrieve(paidSession.payment_intent);
+  if (paidIntent.amount !== 1650) throw new Error('payment intent did not use the discounted total');
+  console.log('discounted payment intent', paidIntent.id, paidIntent.amount);
+
   // --- customer with tax id -> invoice -> finalize -> pay -----------------
   const taxCustomer = await stripe.customers.create({
     email: 'taxed@example.com',

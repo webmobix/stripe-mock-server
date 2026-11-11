@@ -122,6 +122,23 @@ pub fn build_router(state: AppState) -> Router {
                 .delete(api::v1::delete_customer),
         )
         .route(
+            "/v1/coupons",
+            post(api::v1::create_coupon).get(api::v1::list_coupons),
+        )
+        .route(
+            "/v1/coupons/{id}",
+            get(api::v1::get_coupon).delete(api::v1::delete_coupon),
+        )
+        .route(
+            "/v1/tax_rates",
+            post(api::v1::create_tax_rate).get(api::v1::list_tax_rates),
+        )
+        .route("/v1/tax_rates/{id}", get(api::v1::get_tax_rate))
+        .route(
+            "/v1/billing_portal/sessions",
+            post(api::v1::create_billing_portal_session),
+        )
+        .route(
             "/v1/invoices",
             post(api::invoicing::create_invoice).get(api::invoicing::list_invoices),
         )
@@ -169,7 +186,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/v1/subscriptions/{id}",
-            get(api::v1::get_subscription).delete(api::v1::cancel_subscription),
+            get(api::v1::get_subscription)
+                .post(api::v1::update_subscription)
+                .delete(api::v1::cancel_subscription),
         )
         .route(
             "/v1/checkout/sessions",
@@ -235,6 +254,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/mock/checkout/{id}/cancel", get(mock::checkout_cancel))
         .route("/mock/invoices/{id}", get(mock::invoice_page))
         .route("/mock/invoices/{id}/pdf", get(mock::invoice_pdf_page))
+        .route(
+            "/mock/billing-portal/{id}",
+            get(mock::billing_portal_page),
+        )
         // Internal control plane
         .route("/internal/main", get(internal::main_account))
         .route(

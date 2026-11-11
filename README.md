@@ -13,9 +13,12 @@ focused subset of the API across two conventions:
   distinct error envelope.
 
 Object identifiers use real Stripe prefixes (`acct_`, `prod_`, `price_`, `cus_`,
-`txi_`, `in_`, `txr_`, `sub_`, `cs_test_`, `pi_`, `evt_`, `sk_test_`, `pk_test_`,
-`whsec_`), and state changes create events synchronously while webhook delivery
-stays asynchronous.
+`txi_`, `in_`, `txr_`, `coupon_`, `sub_`, `cs_test_`, `bps_`, `pi_`, `evt_`,
+`sk_test_`, `pk_test_`, `whsec_`), and state changes create events synchronously
+while webhook delivery stays asynchronous. The v1 API supports price lookup
+keys, `expand[]` response expansion, subscription quantity updates with
+proration figures, coupons and tax rates, checkout discount/tax totals, and
+billing portal sessions with a hosted page.
 
 > **This is a test tool.** It intentionally exposes generated secrets and
 > never talks to real payment networks. Do not run it in production or on a
@@ -235,6 +238,23 @@ curl -s -X POST $BASE/v1/checkout/sessions \
   --data-urlencode "success_url=https://example.com/success?session={CHECKOUT_SESSION_ID}"
 ```
 
+Beyond the quickstart, the v1 API also supports:
+
+- resolving prices by lookup key and filtering lists with
+  `lookup_keys[]`, plus `expand[]` on price, subscription, and checkout
+  responses — see [`docs/catalog.md`](docs/catalog.md) and
+  [`docs/api-foundations.md`](docs/api-foundations.md);
+- `POST /v1/subscriptions/{id}` for item quantity updates, which returns
+  response-only `prorations` figures and emits
+  `customer.subscription.updated` — see [`docs/billing.md`](docs/billing.md);
+- coupons at `POST/GET/DELETE /v1/coupons` and tax rates at
+  `POST/GET /v1/tax_rates` — see [`docs/coupons.md`](docs/coupons.md) and
+  [`docs/tax-rates.md`](docs/tax-rates.md);
+- checkout `customer_email`, coupons, tax rates, and the
+  subtotal/discount/tax breakdown — see [`docs/checkout.md`](docs/checkout.md);
+- `POST /v1/billing_portal/sessions` and the hosted
+  `/mock/billing-portal/{id}` page — see [`docs/hosted-ui.md`](docs/hosted-ui.md).
+
 ## Using the official Stripe SDK
 
 The drop-in guarantee is validated with the **official Stripe Node SDK
@@ -265,10 +285,13 @@ The script verifies snapshot and connected-scope webhook signatures with
 including the `invoice.paid` event from the invoice flow, and creates a v2 event
 destination and verifies a `v2.core.account.created` thin event with
 `stripe.parseEventNotification`, then retrieves it with
-`stripe.v2.core.events.retrieve`. It also settles a second invoice partially
-through `POST /internal/payment_intents/{id}/resolve` and asserts the invoice
-stays `open` with the remaining balance. It has been run successfully against
-this build; the recorded result is `E2E_SDK_OK`.
+`stripe.v2.core.events.retrieve`. It also exercises lookup-key lookup and price
+product expansion, a subscription quantity update with prorations, a billing
+portal session and its hosted page, and a discounted-taxed checkout whose
+payment intent matches the session total. Finally it settles a second invoice
+partially through `POST /internal/payment_intents/{id}/resolve` and asserts the
+invoice stays `open` with the remaining balance. It has been run successfully
+against this build; the recorded result is `E2E_SDK_OK`.
 
 ## Testing
 
@@ -311,13 +334,15 @@ Hub may create it on first push when the token has permission).
 
 ## Documentation
 
-- [`docs/api-foundations.md`](docs/api-foundations.md) — auth, versions, envelopes, ids, timestamps, form parsing.
+- [`docs/api-foundations.md`](docs/api-foundations.md) — auth, versions, envelopes, ids, timestamps, form parsing, response expansion.
 - [`docs/accounts.md`](docs/accounts.md) — v2 accounts, `include`/default-null, v1 projection, account links, onboarding.
-- [`docs/catalog.md`](docs/catalog.md) — products and prices.
-- [`docs/billing.md`](docs/billing.md) — customers and subscriptions.
+- [`docs/catalog.md`](docs/catalog.md) — products, prices, lookup keys, and product expansion.
+- [`docs/billing.md`](docs/billing.md) — customers, subscriptions, updates, prorations, and billing portal sessions.
+- [`docs/coupons.md`](docs/coupons.md) — coupons, their validation rules, and redemption.
+- [`docs/tax-rates.md`](docs/tax-rates.md) — tax rates and their filters.
 - [`docs/invoicing.md`](docs/invoicing.md) — invoices, invoice lifecycle, and payment intents.
-- [`docs/checkout.md`](docs/checkout.md) — checkout sessions and completion.
-- [`docs/hosted-ui.md`](docs/hosted-ui.md) — mock onboarding/checkout pages and headless driving.
+- [`docs/checkout.md`](docs/checkout.md) — checkout sessions, customer email, discounts, tax, and totals.
+- [`docs/hosted-ui.md`](docs/hosted-ui.md) — mock onboarding/checkout/invoice/billing-portal pages and headless driving.
 - [`docs/webhooks.md`](docs/webhooks.md) — events, destinations, signing, ordering, retries.
 - [`docs/internal.md`](docs/internal.md) — `/internal/**` control plane.
 - [`docs/configuration.md`](docs/configuration.md) — config reference.
@@ -325,11 +350,12 @@ Hub may create it on first push when the token has permission).
 ## Out of scope (future work)
 
 Non-webhook event destination transports (Amazon EventBridge, Azure Event Grid),
-directly usable connected-account keys,
-server-side time advance / billing renewals, full v2 onboarding
-(`account_tokens` + `persons`), a hosted invoice page, `/v1/tax_rates`,
-`invoiceitems`, idempotency keys, concurrent
-per-event delivery, and endpoints beyond the implemented subset. See
+directly usable connected-account keys, server-side time advance / billing
+renewals, full v2 onboarding (`account_tokens` + `persons`), promotion codes and
+coupon updates, subscription item add/remove/price-swap, invoice creation for
+prorations, billing portal configuration or cancellation controls, Stripe Tax
+address resolution / `automatic_tax`, `invoiceitems`, idempotency keys,
+concurrent per-event delivery, and endpoints beyond the implemented subset. See
 `openspec/changes/archive/2026-10-09-build-stripe-mock/design.md` for the
 deferred list.
 

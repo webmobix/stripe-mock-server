@@ -245,6 +245,7 @@ pub struct PriceRow {
     pub active: i64,
     pub created: i64,
     pub metadata: Option<String>,
+    pub lookup_key: Option<String>,
 }
 
 impl PriceRow {
@@ -269,6 +270,7 @@ impl PriceRow {
             "created": self.created,
             "currency": self.currency,
             "livemode": false,
+            "lookup_key": self.lookup_key,
             "metadata": parse_json_or_empty(&self.metadata),
             "nickname": self.nickname,
             "product": self.product_id,
@@ -329,6 +331,142 @@ pub fn tax_id_entry(id: &str, tax_type: &str, value: &str, created: i64) -> Valu
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CouponRow {
+    pub id: String,
+    pub account_id: String,
+    pub percent_off: Option<f64>,
+    pub amount_off: Option<i64>,
+    pub currency: Option<String>,
+    pub duration: String,
+    pub duration_in_months: Option<i64>,
+    pub max_redemptions: Option<i64>,
+    pub times_redeemed: i64,
+    pub redeem_by: Option<i64>,
+    pub name: Option<String>,
+    pub applies_to: Option<String>,
+    pub metadata: Option<String>,
+    pub created: i64,
+}
+
+impl CouponRow {
+    /// A coupon is valid while its `redeem_by` has not passed and it has not
+    /// reached `max_redemptions` when one is set.
+    pub fn is_valid(&self, now: i64) -> bool {
+        let not_expired = self.redeem_by.is_none_or(|deadline| deadline >= now);
+        let has_redemptions_left = self
+            .max_redemptions
+            .is_none_or(|max| self.times_redeemed < max);
+        not_expired && has_redemptions_left
+    }
+
+    pub fn applies_to_products(&self) -> Vec<String> {
+        match parse_json(&self.applies_to) {
+            Value::Object(mut map) => match map.remove("products") {
+                Some(Value::Array(items)) => items
+                    .into_iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "object": "coupon",
+            "amount_off": self.amount_off,
+            "applies_to": { "products": self.applies_to_products() },
+            "created": self.created,
+            "currency": self.currency,
+            "duration": self.duration,
+            "duration_in_months": self.duration_in_months,
+            "livemode": false,
+            "max_redemptions": self.max_redemptions,
+            "metadata": parse_json_or_empty(&self.metadata),
+            "name": self.name,
+            "percent_off": self.percent_off.map(canonical_number),
+            "redeem_by": self.redeem_by,
+            "times_redeemed": self.times_redeemed,
+            "valid": self.is_valid(time::now_epoch()),
+        })
+    }
+}
+
+/// Render a percentage-like number the way Stripe does: whole numbers stay
+/// integers and fractional values keep their decimals.
+fn canonical_number(value: f64) -> Value {
+    if value.fract() == 0.0 {
+        json!(value as i64)
+    } else {
+        json!(value)
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TaxRateRow {
+    pub id: String,
+    pub account_id: String,
+    pub active: i64,
+    pub display_name: String,
+    pub percentage: f64,
+    pub inclusive: i64,
+    pub country: Option<String>,
+    pub state: Option<String>,
+    pub jurisdiction: Option<String>,
+    pub description: Option<String>,
+    pub tax_type: Option<String>,
+    pub metadata: Option<String>,
+    pub created: i64,
+}
+
+impl TaxRateRow {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "object": "tax_rate",
+            "active": self.active != 0,
+            "country": self.country,
+            "created": self.created,
+            "description": self.description,
+            "display_name": self.display_name,
+            "inclusive": self.inclusive != 0,
+            "jurisdiction": self.jurisdiction,
+            "livemode": false,
+            "metadata": parse_json_or_empty(&self.metadata),
+            "percentage": canonical_number(self.percentage),
+            "state": self.state,
+            "tax_type": self.tax_type,
+        })
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BillingPortalSessionRow {
+    pub id: String,
+    pub account_id: String,
+    pub customer: String,
+    pub return_url: String,
+    pub url: String,
+    pub created: i64,
+}
+
+impl BillingPortalSessionRow {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "object": "billing_portal.session",
+            "created": self.created,
+            "customer": self.customer,
+            "livemode": false,
+            "return_url": self.return_url,
+            "url": self.url,
+        })
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SubscriptionRow {
     pub id: String,
     pub account_id: String,
@@ -346,6 +484,27 @@ pub struct SubscriptionRow {
 impl SubscriptionRow {
     pub fn to_json(&self) -> Value {
         let items = parse_json(&Some(self.items.clone()));
+        // Items stored by an older build lack their own period fields; fill
+        // them from the parent row so no JSON migration is needed.
+        let items = match items {
+            Value::Array(items) => Value::Array(
+                items
+                    .into_iter()
+                    .map(|mut item| {
+                        if let Value::Object(map) = &mut item {
+                            map.entry("subscription")
+                                .or_insert_with(|| json!(self.id.clone()));
+                            map.entry("current_period_start")
+                                .or_insert(json!(self.current_period_start));
+                            map.entry("current_period_end")
+                                .or_insert(json!(self.current_period_end));
+                        }
+                        item
+                    })
+                    .collect(),
+            ),
+            other => other,
+        };
         json!({
             "id": self.id,
             "object": "subscription",
@@ -380,27 +539,115 @@ pub struct CheckoutSessionRow {
     pub cancel_url: Option<String>,
     pub customer: Option<String>,
     pub customer_account: Option<String>,
+    pub customer_email: Option<String>,
     pub line_items: String,
     pub payment_intent: Option<String>,
     pub subscription: Option<String>,
+    pub amount_subtotal: Option<i64>,
     pub amount_total: Option<i64>,
+    pub amount_discount: Option<i64>,
+    pub amount_tax: Option<i64>,
+    pub discounts: Option<String>,
     pub currency: Option<String>,
     pub url: Option<String>,
     pub metadata: Option<String>,
 }
 
 impl CheckoutSessionRow {
+    /// The applied coupon snapshots stored on the session.
+    pub fn discounts(&self) -> Vec<Value> {
+        parse_json(&self.discounts)
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Aggregate the stored per-line tax amounts by tax-rate id.
+    fn tax_breakdown(&self) -> Vec<Value> {
+        let mut totals: Vec<(String, i64, i64, Value)> = Vec::new();
+        for line in self.line_items() {
+            let Some(amounts) = line.get("tax_amounts").and_then(Value::as_array) else {
+                continue;
+            };
+            for amount in amounts {
+                let rate = amount.get("tax_rate").cloned().unwrap_or(Value::Null);
+                let rate_id = rate
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let tax = amount.get("amount").and_then(Value::as_i64).unwrap_or(0);
+                let taxable = amount
+                    .get("taxable_amount")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                match totals.iter_mut().find(|(id, _, _, _)| id == &rate_id) {
+                    Some((_, total, taxable_total, _)) => {
+                        *total += tax;
+                        *taxable_total += taxable;
+                    }
+                    None => totals.push((rate_id, tax, taxable, rate)),
+                }
+            }
+        }
+        totals
+            .into_iter()
+            .map(|(id, amount, taxable_amount, rate)| {
+                json!({
+                    "amount": amount,
+                    "taxable_amount": taxable_amount,
+                    "tax_rate": id,
+                    "tax_rate_object": rate,
+                })
+            })
+            .collect()
+    }
+
     pub fn to_json(&self) -> Value {
         let line_items = parse_json(&Some(self.line_items.clone()));
+        let stored_discounts = self.discounts();
+        let breakdown_discounts: Vec<Value> = stored_discounts
+            .iter()
+            .map(|discount| {
+                json!({
+                    "amount": discount.get("amount").cloned().unwrap_or(json!(0)),
+                    "coupon": discount
+                        .get("coupon")
+                        .and_then(|coupon| coupon.get("id"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                })
+            })
+            .collect();
+        let taxes = self.tax_breakdown();
+        // Rows created before the total columns existed keep their old total
+        // and report zero discount and tax.
+        let amount_subtotal = self.amount_subtotal.or(self.amount_total).unwrap_or(0);
+        let amount_discount = self.amount_discount.unwrap_or(0);
+        let amount_tax = self.amount_tax.unwrap_or(0);
+        let amount_total = self.amount_total.unwrap_or(amount_subtotal);
         json!({
             "id": self.id,
             "object": "checkout.session",
-            "amount_total": self.amount_total,
+            "amount_subtotal": amount_subtotal,
+            "amount_total": amount_total,
+            "amount_discount": amount_discount,
+            "amount_tax": amount_tax,
             "cancel_url": self.cancel_url,
             "created": self.created,
             "currency": self.currency,
             "customer": self.customer,
             "customer_account": self.customer_account,
+            "customer_details": {
+                "address": null,
+                "email": self.customer_email,
+                "name": null,
+                "phone": null,
+                "tax_exempt": "unknown",
+                "tax_ids": [],
+            },
+            "customer_email": self.customer_email,
+            "discounts": stored_discounts,
             "expires_at": self.expires_at,
             "livemode": false,
             "metadata": parse_json_or_empty(&self.metadata),
@@ -410,6 +657,14 @@ impl CheckoutSessionRow {
             "status": self.status,
             "subscription": self.subscription,
             "success_url": self.success_url,
+            "total_details": {
+                "amount_discount": amount_discount,
+                "amount_tax": amount_tax,
+                "breakdown": {
+                    "discounts": breakdown_discounts,
+                    "taxes": taxes,
+                },
+            },
             "url": self.url,
             "line_items": list_envelope(
                 &format!("/v1/checkout/sessions/{}/line_items", self.id),
@@ -801,6 +1056,123 @@ mod tests {
         }
     }
 
+    fn checkout(customer_email: Option<&str>) -> CheckoutSessionRow {
+        CheckoutSessionRow {
+            id: "cs_test_1".into(),
+            account_id: "acct_1".into(),
+            mode: "payment".into(),
+            status: "open".into(),
+            created: 10,
+            expires_at: 20,
+            success_url: None,
+            cancel_url: None,
+            customer: Some("cus_1".into()),
+            customer_account: None,
+            customer_email: customer_email.map(str::to_string),
+            line_items: "[]".into(),
+            payment_intent: None,
+            subscription: None,
+            amount_subtotal: Some(2000),
+            amount_total: Some(1650),
+            amount_discount: Some(500),
+            amount_tax: Some(150),
+            discounts: Some(
+                r#"[{"id":"di_1","amount":500,"coupon":{"id":"coupon_1","object":"coupon"}}]"#
+                    .into(),
+            ),
+            currency: Some("usd".into()),
+            url: None,
+            metadata: Some("{}".into()),
+        }
+    }
+
+    #[test]
+    fn checkout_renders_the_customer_email_and_details() {
+        let json = checkout(Some("buyer@example.com")).to_json();
+        assert_eq!(json["customer_email"], "buyer@example.com");
+        assert_eq!(json["customer_details"]["email"], "buyer@example.com");
+    }
+
+    #[test]
+    fn checkout_without_an_email_renders_null() {
+        let json = checkout(None).to_json();
+        assert_eq!(json["customer_email"], Value::Null);
+        assert_eq!(json["customer_details"]["email"], Value::Null);
+    }
+
+    #[test]
+    fn checkout_renders_totals_and_breakdowns() {
+        let mut row = checkout(None);
+        row.line_items = serde_json::to_string(&json!([
+            {
+                "id": "li_1",
+                "tax_rates": [{"id": "txr_1", "percentage": 10}],
+                "tax_amounts": [
+                    {"amount": 75, "taxable_amount": 750, "tax_rate": {"id": "txr_1", "percentage": 10}}
+                ]
+            },
+            {
+                "id": "li_2",
+                "tax_rates": [{"id": "txr_1", "percentage": 10}],
+                "tax_amounts": [
+                    {"amount": 75, "taxable_amount": 750, "tax_rate": {"id": "txr_1", "percentage": 10}}
+                ]
+            }
+        ]))
+        .unwrap();
+        let json = row.to_json();
+        assert_eq!(json["amount_subtotal"], 2000);
+        assert_eq!(json["amount_discount"], 500);
+        assert_eq!(json["amount_tax"], 150);
+        assert_eq!(json["amount_total"], 1650);
+        assert_eq!(json["total_details"]["amount_discount"], 500);
+        assert_eq!(json["total_details"]["breakdown"]["discounts"][0]["coupon"], "coupon_1");
+        assert_eq!(json["total_details"]["breakdown"]["discounts"][0]["amount"], 500);
+        let taxes = json["total_details"]["breakdown"]["taxes"]
+            .as_array()
+            .unwrap();
+        assert_eq!(taxes.len(), 1, "tax rates aggregate by id");
+        assert_eq!(taxes[0]["tax_rate"], "txr_1");
+        assert_eq!(taxes[0]["amount"], 150);
+        assert_eq!(taxes[0]["taxable_amount"], 1500);
+    }
+
+    #[test]
+    fn legacy_checkout_rows_fall_back_to_the_total() {
+        let mut row = checkout(None);
+        row.amount_subtotal = None;
+        row.amount_discount = None;
+        row.amount_tax = None;
+        row.discounts = None;
+        row.amount_total = Some(1000);
+        let json = row.to_json();
+        assert_eq!(json["amount_subtotal"], 1000);
+        assert_eq!(json["amount_total"], 1000);
+        assert_eq!(json["amount_discount"], 0);
+        assert_eq!(json["amount_tax"], 0);
+        assert_eq!(json["discounts"], json!([]));
+        assert_eq!(json["total_details"]["breakdown"]["taxes"], json!([]));
+    }
+
+    #[test]
+    fn billing_portal_session_renders_its_fields() {
+        let row = BillingPortalSessionRow {
+            id: "bps_1".into(),
+            account_id: "acct_1".into(),
+            customer: "cus_1".into(),
+            return_url: "https://example.com/account".into(),
+            url: "http://127.0.0.1:12111/mock/billing-portal/bps_1".into(),
+            created: 10,
+        };
+        let json = row.to_json();
+        assert_eq!(json["object"], "billing_portal.session");
+        assert_eq!(json["id"], "bps_1");
+        assert_eq!(json["customer"], "cus_1");
+        assert_eq!(json["return_url"], "https://example.com/account");
+        assert_eq!(json["url"], "http://127.0.0.1:12111/mock/billing-portal/bps_1");
+        assert_eq!(json["created"], 10);
+    }
+
     #[test]
     fn customer_renders_tax_ids() {
         let row = customer(
@@ -882,6 +1254,141 @@ mod tests {
         assert_eq!(json["lines"]["object"], "list");
         assert_eq!(json["lines"]["data"][0]["id"], "il_1");
         assert_eq!(json["lines"]["url"], "/v1/invoices/in_1/lines");
+    }
+
+    fn coupon(times_redeemed: i64, max_redemptions: Option<i64>, redeem_by: Option<i64>) -> CouponRow {
+        CouponRow {
+            id: "coupon_1".into(),
+            account_id: "acct_1".into(),
+            percent_off: Some(25.0),
+            amount_off: None,
+            currency: Some("usd".into()),
+            duration: "once".into(),
+            duration_in_months: None,
+            max_redemptions,
+            times_redeemed,
+            redeem_by,
+            name: Some("Quarter off".into()),
+            applies_to: Some(r#"{"products":["prod_1"]}"#.into()),
+            metadata: Some("{}".into()),
+            created: 10,
+        }
+    }
+
+    #[test]
+    fn valid_percent_coupon_renders_its_fields() {
+        let json = coupon(0, None, None).to_json();
+        assert_eq!(json["object"], "coupon");
+        assert_eq!(json["percent_off"], 25);
+        assert_eq!(json["amount_off"], Value::Null);
+        assert_eq!(json["valid"], true);
+        assert_eq!(json["times_redeemed"], 0);
+        assert_eq!(json["applies_to"]["products"][0], "prod_1");
+    }
+
+    #[test]
+    fn expired_coupon_is_not_valid() {
+        let json = coupon(0, None, Some(5)).to_json();
+        assert_eq!(json["valid"], false);
+    }
+
+    #[test]
+    fn fully_redeemed_coupon_is_not_valid() {
+        let json = coupon(3, Some(3), None).to_json();
+        assert_eq!(json["valid"], false);
+        assert!(!coupon(3, Some(3), None).is_valid(0));
+        assert!(coupon(2, Some(3), None).is_valid(0));
+    }
+
+    #[test]
+    fn subscription_items_keep_or_inherit_their_periods() {
+        let new_item = json!({
+            "id": "si_1",
+            "object": "subscription_item",
+            "current_period_start": 100,
+            "current_period_end": 200,
+            "subscription": "sub_1",
+            "price": {"id": "price_1"},
+            "quantity": 2
+        });
+        let row = SubscriptionRow {
+            id: "sub_1".into(),
+            account_id: "acct_1".into(),
+            customer: Some("cus_1".into()),
+            customer_account: None,
+            status: "active".into(),
+            created: 90,
+            current_period_start: Some(100),
+            current_period_end: Some(200),
+            cancel_at_period_end: 0,
+            items: serde_json::to_string(&json!([new_item])).unwrap(),
+            metadata: Some("{}".into()),
+        };
+        let json = row.to_json();
+        let item = &json["items"]["data"][0];
+        assert_eq!(item["subscription"], "sub_1");
+        assert_eq!(item["current_period_start"], 100);
+        assert_eq!(item["current_period_end"], 200);
+
+        // An item stored by an older build gains the fields from the parent.
+        let legacy = SubscriptionRow {
+            items: r#"[{"id":"si_old","object":"subscription_item","price":{"id":"price_1"},"quantity":1}]"#
+                .into(),
+            ..row
+        };
+        let json = legacy.to_json();
+        let item = &json["items"]["data"][0];
+        assert_eq!(item["subscription"], "sub_1");
+        assert_eq!(item["current_period_start"], 100);
+        assert_eq!(item["current_period_end"], 200);
+    }
+
+    #[test]
+    fn tax_rate_renders_its_flags_and_percentage() {
+        let row = TaxRateRow {
+            id: "txr_1".into(),
+            account_id: "acct_1".into(),
+            active: 1,
+            display_name: "VAT".into(),
+            percentage: 20.0,
+            inclusive: 0,
+            country: Some("DE".into()),
+            state: None,
+            jurisdiction: Some("DE".into()),
+            description: Some("German VAT".into()),
+            tax_type: Some("vat".into()),
+            metadata: Some("{}".into()),
+            created: 10,
+        };
+        let json = row.to_json();
+        assert_eq!(json["object"], "tax_rate");
+        assert_eq!(json["display_name"], "VAT");
+        assert_eq!(json["percentage"], 20);
+        assert_eq!(json["inclusive"], false);
+        assert_eq!(json["active"], true);
+        assert_eq!(json["jurisdiction"], "DE");
+    }
+
+    #[test]
+    fn price_renders_its_lookup_key_or_null() {
+        let mut row = PriceRow {
+            id: "price_1".into(),
+            account_id: "acct_1".into(),
+            product_id: "prod_1".into(),
+            currency: "usd".into(),
+            unit_amount: Some(1000),
+            price_type: "recurring".into(),
+            recurring_interval: Some("month".into()),
+            recurring_interval_count: Some(1),
+            nickname: None,
+            active: 1,
+            created: 10,
+            metadata: Some("{}".into()),
+            lookup_key: None,
+        };
+        assert_eq!(row.to_json()["lookup_key"], Value::Null);
+        row.lookup_key = Some("pro_monthly".into());
+        assert_eq!(row.to_json()["lookup_key"], "pro_monthly");
     }
 
     #[test]

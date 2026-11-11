@@ -6,7 +6,10 @@ use sqlx::SqlitePool;
 use crate::AppState;
 use crate::api::v1;
 use crate::events;
-use crate::models::{AccountRow, CheckoutSessionRow, InvoiceRow};
+use crate::models::{
+    AccountRow, BillingPortalSessionRow, CheckoutSessionRow, CustomerRow, InvoiceRow,
+    SubscriptionRow,
+};
 use crate::time;
 
 /// Well-known checkout session id that is always available so the mock checkout
@@ -782,4 +785,121 @@ fn format_amount(amount: i64, currency: &str) -> String {
         abs % divisor as u64,
         width = decimals as usize
     )
+}
+
+// ---------------------------------------------------------------------------
+// Billing portal
+// ---------------------------------------------------------------------------
+
+/// The hosted page of a billing portal session. Like the other hosted pages it
+/// is unauthenticated and lists only the session's customer's subscriptions.
+pub async fn billing_portal_page(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let session: Option<BillingPortalSessionRow> =
+        sqlx::query_as("SELECT * FROM billing_portal_sessions WHERE id = ?1")
+            .bind(&id)
+            .fetch_optional(&st.pool)
+            .await
+            .unwrap_or(None);
+    let Some(session) = session else {
+        return page_error("This billing portal session is invalid.");
+    };
+    let customer: Option<CustomerRow> =
+        sqlx::query_as("SELECT * FROM customers WHERE id = ?1 AND account_id = ?2")
+            .bind(&session.customer)
+            .bind(&session.account_id)
+            .fetch_optional(&st.pool)
+            .await
+            .unwrap_or(None);
+    let subscriptions: Vec<SubscriptionRow> = sqlx::query_as(
+        "SELECT * FROM subscriptions WHERE account_id = ?1 AND customer = ?2 \
+         ORDER BY created DESC, rowid DESC",
+    )
+    .bind(&session.account_id)
+    .bind(&session.customer)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+
+    let escaped_id = crate::util::html_escape(&id);
+    let customer_email = customer
+        .as_ref()
+        .and_then(|customer| customer.email.clone())
+        .map(|email| format!("<p class=\"text-sm opacity-70\">{}</p>", crate::util::html_escape(&email)))
+        .unwrap_or_default();
+    let subscription_rows = if subscriptions.is_empty() {
+        r#"<p id="no-subscriptions" class="opacity-70">This customer has no subscriptions.</p>"#
+            .to_string()
+    } else {
+        let mut rows = String::new();
+        for subscription in &subscriptions {
+            let json = subscription.to_json();
+            let items = json["items"]["data"].as_array().cloned().unwrap_or_default();
+            let items_html = items
+                .iter()
+                .map(|item| {
+                    let quantity = item.get("quantity").and_then(Value::as_i64).unwrap_or(1);
+                    let price_id = item
+                        .get("price")
+                        .and_then(|price| price.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown price");
+                    let period_end = item
+                        .get("current_period_end")
+                        .and_then(Value::as_i64)
+                        .map(|end| end.to_string())
+                        .unwrap_or_else(|| "n/a".to_string());
+                    format!(
+                        "<li>{} × {} — current period ends {}</li>",
+                        quantity,
+                        crate::util::html_escape(price_id),
+                        crate::util::html_escape(&period_end)
+                    )
+                })
+                .collect::<String>();
+            rows.push_str(&format!(
+                r#"<tr>
+  <td class="font-mono text-xs">{id}</td>
+  <td><span class="badge">{status}</span><ul class="mt-2 list-disc list-inside">{items}</ul></td>
+</tr>"#,
+                id = crate::util::html_escape(&subscription.id),
+                status = crate::util::html_escape(&subscription.status),
+                items = items_html,
+            ));
+        }
+        format!(
+            r#"<div class="overflow-x-auto">
+  <table class="table">
+    <thead><tr><th>Subscription</th><th>Status and items</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>"#
+        )
+    };
+
+    let body = format!(
+        r#"<div class="card bg-base-100 shadow">
+  <div class="card-body">
+    <h2 class="card-title">Billing portal</h2>
+    <p>Customer <span class="font-mono">{customer}</span></p>
+    {customer_email}
+    <p class="text-sm opacity-70">Session {session_id}</p>
+  </div>
+</div>
+<section class="mt-6">
+  <h3 class="text-lg font-semibold mb-2">Subscriptions</h3>
+  {subscriptions}
+</section>
+<div class="mt-6">
+  <a id="return-link" class="btn" href="{return_url}">Return to the application</a>
+</div>"#,
+        customer = crate::util::html_escape(&session.customer),
+        customer_email = customer_email,
+        session_id = escaped_id,
+        subscriptions = subscription_rows,
+        return_url = crate::util::html_escape(&session.return_url),
+    );
+    Html(shell("Billing portal", &body)).into_response()
 }
