@@ -79,16 +79,26 @@ two connected accounts may each hold the same key.
 
 ## Product expansion
 
-Price responses accept `expand[]=product` on create, retrieve, and list, as well
-as inside subscription and checkout responses:
+Price responses accept `expand[]` on create, retrieve, and list, as well as
+inside subscription and checkout responses:
 
 ```bash
 curl -s "$BASE/v1/prices/$PRICE_ID?expand[]=product" \
   -H "Authorization: Bearer $KEY"
 ```
 
-The `product` field is then the full product object instead of its `prod_` id.
-See `docs/api-foundations.md` for every accepted expansion shape.
+On list responses, paths are resolved against the list envelope, so use
+`data.product` to expand every returned price:
+
+```bash
+curl -s "$BASE/v1/prices?lookup_keys[]=normal_monthly_flat&expand[]=data.product" \
+  -H "Authorization: Bearer $KEY"
+```
+
+The item-relative list form `expand[]=product` remains accepted for
+compatibility. The `product` field is then the full product object instead of
+its `prod_` id. See `docs/api-foundations.md` for every accepted expansion
+shape.
 
 ## Lists and filters
 

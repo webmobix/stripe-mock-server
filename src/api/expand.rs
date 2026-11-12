@@ -31,6 +31,27 @@ pub async fn expand_response(
     value
 }
 
+/// Expand every path in `paths` over a list envelope and each `data` item.
+///
+/// The envelope pass makes envelope-relative paths such as `data.product`
+/// work, while the per-item pass preserves item-relative paths such as
+/// `product`.
+pub async fn expand_list_response(
+    pool: &SqlitePool,
+    account_id: &str,
+    mut value: Value,
+    paths: &[String],
+) -> Value {
+    value = expand_response(pool, account_id, value, paths).await;
+    if let Some(Value::Array(items)) = value.get_mut("data") {
+        for item in items {
+            let current = std::mem::take(item);
+            *item = expand_response(pool, account_id, current, paths).await;
+        }
+    }
+    value
+}
+
 fn walk<'a>(
     pool: &'a SqlitePool,
     account_id: &'a str,
@@ -167,6 +188,73 @@ mod tests {
         assert_eq!(value["items"]["data"][0]["price"]["product"]["id"], "prod_1");
         assert_eq!(value["items"]["data"][0]["price"]["product"]["object"], "product");
         assert_eq!(value["items"]["data"][1]["price"]["product"]["id"], "prod_1");
+    }
+
+    #[tokio::test]
+    async fn expands_a_list_envelope_path() {
+        let pool = pool().await;
+        add_product(&pool, "acct_1", "prod_1").await;
+        let value = json!({
+            "object": "list",
+            "data": [
+                { "id": "price_1", "product": "prod_1" },
+                { "id": "price_2", "product": "prod_1" }
+            ]
+        });
+        let value = expand_list_response(&pool, "acct_1", value, &["data.product".into()]).await;
+        assert_eq!(value["data"][0]["product"]["id"], "prod_1");
+        assert_eq!(value["data"][0]["product"]["object"], "product");
+        assert_eq!(value["data"][1]["product"]["id"], "prod_1");
+    }
+
+    #[tokio::test]
+    async fn expands_a_list_item_relative_path() {
+        let pool = pool().await;
+        add_product(&pool, "acct_1", "prod_1").await;
+        let value = json!({
+            "object": "list",
+            "data": [
+                { "id": "price_1", "product": "prod_1" },
+                { "id": "price_2", "product": "prod_1" }
+            ]
+        });
+        let value = expand_list_response(&pool, "acct_1", value, &["product".into()]).await;
+        assert_eq!(value["data"][0]["product"]["id"], "prod_1");
+        assert_eq!(value["data"][1]["product"]["object"], "product");
+    }
+
+    #[tokio::test]
+    async fn expands_a_nested_list_envelope_path() {
+        let pool = pool().await;
+        add_product(&pool, "acct_1", "prod_1").await;
+        let value = json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "sub_1",
+                    "items": {
+                        "data": [
+                            { "price": { "id": "price_1", "product": "prod_1" } }
+                        ]
+                    }
+                }
+            ]
+        });
+        let value = expand_list_response(
+            &pool,
+            "acct_1",
+            value,
+            &["data.items.data.price.product".into()],
+        )
+        .await;
+        assert_eq!(
+            value["data"][0]["items"]["data"][0]["price"]["product"]["id"],
+            "prod_1"
+        );
+        assert_eq!(
+            value["data"][0]["items"]["data"][0]["price"]["product"]["object"],
+            "product"
+        );
     }
 
     #[tokio::test]

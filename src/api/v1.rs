@@ -4,7 +4,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::api::expand::expand_response;
+use crate::api::expand::{expand_list_response, expand_response};
 use crate::api::{
     collect_form_list, collect_list_param, get_array, get_bool, get_i64, get_str, ok, paginate,
 };
@@ -481,11 +481,10 @@ pub async fn list_prices(
         |p| p.id.clone(),
     );
     let expands = collect_list_param(query.as_deref().unwrap_or(""), "expand");
-    let mut data = Vec::new();
-    for price in &page {
-        data.push(expand_response(&st.pool, &ctx.account_id, price.to_json(), &expands).await);
-    }
-    Ok(ok(list_envelope("/v1/prices", data, has_more)))
+    let data = page.iter().map(PriceRow::to_json).collect();
+    let envelope = list_envelope("/v1/prices", data, has_more);
+    let value = expand_list_response(&st.pool, &ctx.account_id, envelope, &expands).await;
+    Ok(ok(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -970,19 +969,10 @@ pub async fn list_subscriptions(
         |s| s.id.clone(),
     );
     let expands = collect_list_param(query.as_deref().unwrap_or(""), "expand");
-    let mut data = Vec::new();
-    for subscription in &page {
-        data.push(
-            expand_response(
-                &st.pool,
-                &ctx.account_id,
-                subscription.to_json(),
-                &expands,
-            )
-            .await,
-        );
-    }
-    Ok(ok(list_envelope("/v1/subscriptions", data, has_more)))
+    let data = page.iter().map(SubscriptionRow::to_json).collect();
+    let envelope = list_envelope("/v1/subscriptions", data, has_more);
+    let value = expand_list_response(&st.pool, &ctx.account_id, envelope, &expands).await;
+    Ok(ok(value))
 }
 
 pub async fn cancel_subscription(

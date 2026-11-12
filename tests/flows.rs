@@ -918,6 +918,7 @@ async fn expansion_embeds_referenced_products() {
             ("currency", "usd"),
             ("unit_amount", "1000"),
             ("recurring[interval]", "month"),
+            ("lookup_key", "normal_monthly_flat"),
             ("expand[]", "product"),
         ])
         .send()
@@ -953,6 +954,28 @@ async fn expansion_embeds_referenced_products() {
         .await
         .unwrap();
     assert_eq!(listed["data"][0]["product"]["id"], product_id);
+
+    let listed_by_envelope: Value = server
+        .client
+        .get(server.url(
+            "/v1/prices?lookup_keys[]=normal_monthly_flat&expand[]=data.product",
+        ))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed_by_envelope["data"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        listed_by_envelope["data"][0]["product"]["id"],
+        product_id
+    );
+    assert_eq!(
+        listed_by_envelope["data"][0]["product"]["object"],
+        "product"
+    );
 
     let customer: Value = server
         .client
@@ -1002,6 +1025,56 @@ async fn expansion_embeds_referenced_products() {
         .unwrap();
     assert_eq!(
         retrieved["items"]["data"][0]["price"]["product"]["object"],
+        "product"
+    );
+
+    let listed: Value = server
+        .client
+        .get(server.url(
+            "/v1/subscriptions?expand[]=data.items.data.price.product",
+        ))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed_subscription = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == subscription_id.as_str())
+        .unwrap();
+    assert_eq!(
+        listed_subscription["items"]["data"][0]["price"]["product"]["id"],
+        product_id
+    );
+    assert_eq!(
+        listed_subscription["items"]["data"][0]["price"]["product"]["object"],
+        "product"
+    );
+
+    let listed_item_relative: Value = server
+        .client
+        .get(server.url(
+            "/v1/subscriptions?expand[]=items.data.price.product",
+        ))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed_item_relative_subscription = listed_item_relative["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == subscription_id.as_str())
+        .unwrap();
+    assert_eq!(
+        listed_item_relative_subscription["items"]["data"][0]["price"]["product"]["object"],
         "product"
     );
 

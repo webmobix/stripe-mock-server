@@ -75,7 +75,9 @@ Endpoints that return expandable references accept repeated `expand[]`
 parameters. Retrieval and list requests read them from the query string;
 create and update requests read them from the form body. Each path is
 dot-separated, traverses every element of an embedded list, and replaces a
-reference id with the full object it names.
+reference id with the full object it names. On list requests, a path is also
+resolved against the list envelope, so `data.product` expands every returned
+item's product. Item-relative list paths such as `product` remain supported.
 
 Accepted parameter shapes:
 
@@ -99,6 +101,16 @@ curl -s "http://127.0.0.1:12111/v1/prices/price_123?expand[]=product" \
 The response's `product` is then the full `product` object instead of its
 `prod_` id. Nested paths include `items.data.price.product` on subscriptions
 and `line_items.data.price.product` on checkout sessions.
+
+To expand a list, use the envelope-relative path:
+
+```bash
+curl -s "http://127.0.0.1:12111/v1/prices?lookup_keys[]=normal_monthly_flat&expand[]=data.product" \
+  -H "Authorization: Bearer $STRIPE_SECRET_KEY"
+```
+
+Every returned price then carries its full `product` object. The item-relative
+list form `expand[]=product` remains accepted for compatibility.
 
 ## Prefixed identifiers and keys
 
