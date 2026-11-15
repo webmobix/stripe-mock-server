@@ -39,9 +39,9 @@ than submitting the completion form.
 
 Submitting posts to `POST /mock/checkout/{id}` with `card=success`, which
 completes the session transactionally and redirects to `success_url`
-(substituting `{CHECKOUT_SESSION_ID}`). `card=fail` re-renders with a decline
-notice and leaves the session open. `GET /mock/checkout/{id}/cancel` redirects to
-`cancel_url`.
+(substituting `{CHECKOUT_SESSION_ID}`), or to `return_url` for an embedded
+session. `card=fail` re-renders with a decline notice and leaves the session
+open. `GET /mock/checkout/{id}/cancel` redirects to `cancel_url`.
 
 ### Static demo session
 

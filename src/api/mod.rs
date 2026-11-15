@@ -1,5 +1,8 @@
+pub mod billing;
 pub mod expand;
 pub mod invoicing;
+pub mod meters;
+pub mod payment_methods;
 pub mod v1;
 pub mod v2;
 

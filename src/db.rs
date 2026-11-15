@@ -69,7 +69,12 @@ CREATE TABLE IF NOT EXISTS prices (
     active INTEGER NOT NULL DEFAULT 1,
     created INTEGER NOT NULL,
     metadata TEXT,
-    lookup_key TEXT
+    lookup_key TEXT,
+    billing_scheme TEXT NOT NULL DEFAULT 'per_unit',
+    tiers TEXT,
+    tiers_mode TEXT,
+    usage_type TEXT,
+    meter_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS customers (
@@ -80,7 +85,19 @@ CREATE TABLE IF NOT EXISTS customers (
     currency TEXT,
     created INTEGER NOT NULL,
     tax_ids TEXT,
-    metadata TEXT
+    metadata TEXT,
+    invoice_settings TEXT
+);
+
+CREATE TABLE IF NOT EXISTS payment_methods (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    customer TEXT,
+    pm_type TEXT NOT NULL,
+    card TEXT,
+    billing_details TEXT,
+    metadata TEXT,
+    created INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS invoices (
@@ -104,7 +121,14 @@ CREATE TABLE IF NOT EXISTS invoices (
     lines TEXT NOT NULL DEFAULT '[]',
     customer_tax_ids TEXT NOT NULL DEFAULT '[]',
     description TEXT,
-    metadata TEXT
+    metadata TEXT,
+    subscription TEXT,
+    billing_reason TEXT,
+    period_start INTEGER,
+    period_end INTEGER,
+    collection_method TEXT NOT NULL DEFAULT 'send_invoice',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    payment_intent TEXT
 );
 
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -143,7 +167,11 @@ CREATE TABLE IF NOT EXISTS checkout_sessions (
     discounts TEXT,
     currency TEXT,
     url TEXT,
-    metadata TEXT
+    metadata TEXT,
+    ui_mode TEXT NOT NULL DEFAULT 'hosted_page',
+    return_url TEXT,
+    client_secret TEXT,
+    subscription_metadata TEXT
 );
 
 CREATE TABLE IF NOT EXISTS coupons (
@@ -199,6 +227,50 @@ CREATE TABLE IF NOT EXISTS payment_intents (
     created INTEGER NOT NULL,
     checkout_session TEXT,
     metadata TEXT
+);
+
+-- Billing meters aggregate meter events over a billing period.
+CREATE TABLE IF NOT EXISTS billing_meters (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    event_name TEXT NOT NULL,
+    aggregation_formula TEXT NOT NULL,
+    customer_payload_key TEXT NOT NULL DEFAULT 'stripe_customer_id',
+    value_payload_key TEXT NOT NULL DEFAULT 'value',
+    event_time_window TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    deactivated_at INTEGER,
+    created INTEGER NOT NULL,
+    updated INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS meter_events (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    meter_id TEXT NOT NULL,
+    event_name TEXT NOT NULL,
+    identifier TEXT NOT NULL,
+    customer TEXT,
+    payload TEXT NOT NULL,
+    value REAL NOT NULL,
+    timestamp INTEGER NOT NULL,
+    created INTEGER NOT NULL,
+    UNIQUE(account_id, identifier)
+);
+
+-- Idempotency keys cache a successful v1 mutation response for replay.
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    idempotency_key TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    status INTEGER,
+    body TEXT,
+    content_type TEXT,
+    created INTEGER NOT NULL,
+    PRIMARY KEY (idempotency_key, scope, method, path)
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -266,6 +338,9 @@ CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer);
 CREATE INDEX IF NOT EXISTS idx_coupons_account ON coupons(account_id);
 CREATE INDEX IF NOT EXISTS idx_tax_rates_account ON tax_rates(account_id);
 CREATE INDEX IF NOT EXISTS idx_billing_portal_sessions_account ON billing_portal_sessions(account_id);
+CREATE INDEX IF NOT EXISTS idx_payment_methods_customer ON payment_methods(customer);
+CREATE INDEX IF NOT EXISTS idx_billing_meters_account ON billing_meters(account_id);
+CREATE INDEX IF NOT EXISTS idx_meter_events_meter ON meter_events(meter_id, customer, timestamp);
 "#;
 
 pub async fn connect(path: &str) -> Result<SqlitePool, sqlx::Error> {
@@ -297,6 +372,10 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // column yet when the index would be created.
     pool.execute(sqlx::raw_sql(
         "CREATE INDEX IF NOT EXISTS idx_payment_intents_invoice ON payment_intents(invoice);",
+    ))
+    .await?;
+    pool.execute(sqlx::raw_sql(
+        "CREATE INDEX IF NOT EXISTS idx_invoices_subscription ON invoices(subscription);",
     ))
     .await?;
     Ok(())
@@ -338,8 +417,35 @@ async fn migrate_legacy_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         ("amount_discount", "INTEGER"),
         ("amount_tax", "INTEGER"),
         ("discounts", "TEXT"),
+        ("ui_mode", "TEXT NOT NULL DEFAULT 'hosted_page'"),
+        ("return_url", "TEXT"),
+        ("client_secret", "TEXT"),
+        ("subscription_metadata", "TEXT"),
     ] {
         add_column_if_missing(pool, "checkout_sessions", column, decl).await?;
+    }
+    // Metered/tiered price columns.
+    for (column, decl) in [
+        ("billing_scheme", "TEXT NOT NULL DEFAULT 'per_unit'"),
+        ("tiers", "TEXT"),
+        ("tiers_mode", "TEXT"),
+        ("usage_type", "TEXT"),
+        ("meter_id", "TEXT"),
+    ] {
+        add_column_if_missing(pool, "prices", column, decl).await?;
+    }
+    // Customer default payment method and invoice/subscription billing columns.
+    add_column_if_missing(pool, "customers", "invoice_settings", "TEXT").await?;
+    for (column, decl) in [
+        ("subscription", "TEXT"),
+        ("billing_reason", "TEXT"),
+        ("period_start", "INTEGER"),
+        ("period_end", "INTEGER"),
+        ("collection_method", "TEXT NOT NULL DEFAULT 'send_invoice'"),
+        ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("payment_intent", "TEXT"),
+    ] {
+        add_column_if_missing(pool, "invoices", column, decl).await?;
     }
     Ok(())
 }
@@ -387,6 +493,10 @@ pub async fn reset_state(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "subscriptions",
         "coupons",
         "tax_rates",
+        "payment_methods",
+        "meter_events",
+        "billing_meters",
+        "idempotency_keys",
         "customers",
         "prices",
         "products",
@@ -477,7 +587,9 @@ mod tests {
             "discounts",
         ] {
             assert!(
-                has_column(&pool, "checkout_sessions", column).await.unwrap(),
+                has_column(&pool, "checkout_sessions", column)
+                    .await
+                    .unwrap(),
                 "checkout_sessions.{column} was not added"
             );
         }

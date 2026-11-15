@@ -106,6 +106,72 @@ webhook_endpoint = {{ url = "{target_url}" }}
     }
 }
 
+/// Boot a fresh server with configured main-account keys and a configured
+/// webhook signing secret.
+pub async fn spawn_with_main_keys(
+    secret_key: &str,
+    publishable_key: &str,
+    signing_secret: &str,
+) -> TestServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let db_path = std::env::temp_dir().join(format!(
+        "stripe-mock-it-{}.db",
+        stripe_mock::ids::random_string(10)
+    ));
+    let target_url = format!("http://127.0.0.1:{port}/unused-webhook");
+    let config_text = format!(
+        r#"
+[server]
+bind = "127.0.0.1"
+port = {port}
+public_base_url = "http://127.0.0.1:{port}"
+
+[database]
+path = "{}"
+
+[main_account]
+business_type = "company"
+country = "US"
+email = "owner@example.com"
+name = "Mock Platform"
+secret_key = "{secret_key}"
+publishable_key = "{publishable_key}"
+
+[[event_destinations]]
+name = "app"
+event_payload = "snapshot"
+events_from = ["@self", "@accounts"]
+enabled_events = ["*"]
+enabled = true
+webhook_endpoint = {{ url = "{target_url}", signing_secret = "{signing_secret}" }}
+"#,
+        db_path.to_string_lossy(),
+    );
+    let config = Config::from_str(&config_text).unwrap();
+    let (state, listener) = boot_with_listener(config, listener).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let app = build_router(state.clone());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    wait_for_health(&client, &base_url).await;
+
+    TestServer {
+        base_url,
+        client,
+        pool: state.pool.clone(),
+        db_path,
+        destination_url: target_url,
+    }
+}
+
 /// Boot a fresh server with a single config-declared thin event destination
 /// pointing at the receiver.
 pub async fn spawn_with_thin_destination(receiver_url: String) -> TestServer {

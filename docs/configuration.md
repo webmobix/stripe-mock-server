@@ -28,6 +28,20 @@ Describes the platform account created on first boot. All fields optional.
 | `country` | string | Two-letter country code. |
 | `email` | string | Account email. |
 | `name` | string | Business name used in the v1/v2 identity. |
+| `secret_key` | string | Fixed `sk_test_...` key. When unset one is generated at first boot. Configured keys are re-applied after `/internal/reset`. |
+| `publishable_key` | string | Fixed `pk_test_...` key, with the same lifecycle as `secret_key`. |
+
+A configured key makes the mock deterministic between test runs:
+
+```toml
+[main_account]
+secret_key = "sk_test_stateleo"
+publishable_key = "pk_test_stateleo"
+```
+
+`POST /internal/reset` deletes all mutable state and reseeds, but the configured
+key and signing-secret values are seeded again, so a test can reset between
+cases without re-reading them.
 
 ## `[[event_destinations]]`
 
@@ -50,6 +64,7 @@ receive both formats, exactly as Stripe requires a separate endpoint per format.
 | `events_from` | array | `["@self"]` | `"@self"` = this account; `"@accounts"` = accounts you manage (connected). |
 | `enabled_events` | array of strings | `["*"]` | `*`, exact names, or `"prefix.*"` patterns. |
 | `webhook_endpoint.url` | string | required | Receiver URL. |
+| `webhook_endpoint.signing_secret` | string | unset | Optional fixed `whsec_...` value. Because secrets are shared per URL, the first configured value for a URL wins; it is re-applied after every reset. |
 | `enabled` | bool | `true` | Maps to destination `status` (`enabled`/`disabled`). |
 | `description` | string | unset | Optional user-defined description. |
 | `type` | string | `"webhook_endpoint"` | Only `webhook_endpoint` is supported. |

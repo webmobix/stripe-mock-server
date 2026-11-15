@@ -137,14 +137,50 @@ are in minor units and the per-line tax is rounded to the nearest minor unit
 The customer's tax ids (see [`billing.md`](billing.md)) are copied to the
 invoice's `customer_tax_ids`, so an invoice carries the tax details on its own.
 
+## Preview the upcoming invoice
+
+`POST /v1/invoices/create_preview` (the SDK's `invoices.createPreview`) prices
+the next invoice for a subscription without persisting it or emitting events.
+`GET /v1/invoices/upcoming` accepts the same fields as query parameters.
+
+```bash
+curl -s -X POST $BASE/v1/invoices/create_preview \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode "customer=$CID" \
+  --data-urlencode "subscription=$SID"
+```
+
+The preview has an `upcoming_in_` id, `object=invoice`, `status=draft`,
+`billing_reason=upcoming`, `period_start`/`period_end`, and computed `lines`.
+Licensed items are priced for the next period. Metered items report the usage
+accrued so far in the **current** period, because metered usage is billed in
+arrears. The preview is never listed and has no hosted page or PDF.
+
+A customer is required, either explicitly or implied by the subscription. Pass
+`subscription_details[items][]` to preview a potential subscription instead of
+an existing one:
+
+```bash
+curl -s -X POST $BASE/v1/invoices/create_preview \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode "customer=$CID" \
+  --data-urlencode "subscription_details[items][0][price]=$PRICE_ID" \
+  --data-urlencode "subscription_details[items][0][quantity]=3"
+```
+
 ## Read invoices
 
 ```bash
 curl -s "$BASE/v1/invoices/$IID" -H "Authorization: Bearer $KEY"
 curl -s "$BASE/v1/invoices?customer=$CID" -H "Authorization: Bearer $KEY"
 curl -s "$BASE/v1/invoices?status=open" -H "Authorization: Bearer $KEY"
+curl -s "$BASE/v1/invoices?subscription=$SID" -H "Authorization: Bearer $KEY"
 curl -s "$BASE/v1/invoices/$IID/lines" -H "Authorization: Bearer $KEY"
 ```
+
+Subscription invoices also report `subscription`, `billing_reason`
+(`subscription_create` or `subscription_cycle`), `period_start`,
+`period_end`, `collection_method=charge_automatically`, and `attempt_count`.
 
 ## Edit the lines of a draft invoice
 

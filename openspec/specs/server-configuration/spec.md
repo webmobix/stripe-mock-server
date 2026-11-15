@@ -17,16 +17,21 @@ The server SHALL load a TOML configuration specifying the server bind address an
 
 ### Requirement: Main account seeding
 
-On first boot the server SHALL create the main account from configuration and SHALL generate and persist its secret and publishable keys.
+On first boot the server SHALL create the main account from configuration and SHALL generate and persist its secret and publishable keys. When `[main_account]` supplies `secret_key` or `publishable_key`, the server SHALL use the configured value and re-apply it after every reset.
 
 #### Scenario: Keys persisted
 
 - **WHEN** the server restarts with the same database
 - **THEN** the main account's keys are unchanged
 
+#### Scenario: Configured keys survive reset
+
+- **WHEN** the configuration fixes `secret_key` and `publishable_key` and a client calls `/internal/reset`
+- **THEN** the main account again reports the configured values
+
 ### Requirement: Event destination configuration
 
-The configuration SHALL model webhooks solely as event destinations (`[[event_destinations]]`), each declaring a `webhook_endpoint.url`, an `event_payload` of `snapshot` or `thin`, an `events_from` list of `@self`/`@accounts`, an `enabled_events` allow-list or `*`, and an `enabled` flag, and the server SHALL generate a signing secret **per endpoint URL** (shared by all destinations with the same `webhook_endpoint.url`). It SHALL NOT accept a separate `[[webhook_targets]]` section.
+The configuration SHALL model webhooks solely as event destinations (`[[event_destinations]]`) declaring a URL, an `event_payload` of `snapshot` or `thin`, an `events_from` list, an `enabled_events` allow-list, and an `enabled` flag. It SHALL NOT accept `[[webhook_targets]]`. The server SHALL generate one signing secret per endpoint URL, shared by destinations with that URL. `webhook_endpoint.signing_secret` MAY fix that value; a configured secret SHALL win and SHALL be re-applied after reset.
 
 #### Scenario: Seed destinations at boot
 

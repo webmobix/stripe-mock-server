@@ -22,6 +22,43 @@ The response is a `cs_test_` session with `status=open`, `amount_total`,
 `line_items`, and a `url` pointing at the mock checkout page. Optional
 `customer` or `customer_account` fields are recorded.
 
+## Embedded checkout
+
+Set `ui_mode=embedded_page` (the older `embedded` spelling is accepted too) and
+supply `return_url`. The session reports `ui_mode`, `return_url`, and a
+`client_secret`; it has no `url` because there is no hosted page:
+
+```bash
+SESSION=$(curl -s -X POST $BASE/v1/checkout/sessions \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode 'mode=subscription' \
+  --data-urlencode 'ui_mode=embedded_page' \
+  --data-urlencode 'return_url=https://example.com/return?session={CHECKOUT_SESSION_ID}' \
+  --data-urlencode "customer=$CID" \
+  --data-urlencode "line_items[0][price]=$PRICE_ID")
+echo "$SESSION" | python3 -c 'import sys,json;print(json.load(sys.stdin)["client_secret"])'
+```
+
+`ui_mode=elements` is accepted as well. Hosted sessions default to
+`ui_mode=hosted_page`, report `client_secret: null`, and keep their `url`.
+Completing an embedded session redirects to `return_url` (with
+`{CHECKOUT_SESSION_ID}` substituted); completing a hosted session redirects to
+`success_url`.
+
+Subscription metadata can be supplied inline and is copied to the subscription
+created on completion:
+
+```bash
+curl -s -X POST $BASE/v1/checkout/sessions \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode 'mode=subscription' \
+  --data-urlencode 'ui_mode=embedded_page' \
+  --data-urlencode 'return_url=https://example.com/return' \
+  --data-urlencode "customer=$CID" \
+  --data-urlencode "line_items[0][price]=$PRICE_ID" \
+  --data-urlencode 'subscription_data[metadata][plan]=team'
+```
+
 ## Customer email
 
 A session may carry `customer_email`. When neither `customer` nor
@@ -121,14 +158,19 @@ single transaction that:
 
 - marks the session `complete` (and `payment_status=paid`),
 - for `payment` mode creates a **succeeded** `pi_` payment intent,
-- for `subscription` mode creates an active `sub_` subscription,
+- for `subscription` mode creates an active `sub_` subscription and its paid
+  first invoice (`billing_reason=subscription_create`),
 - for `setup` mode creates neither,
+- saves a simulated Visa `pm_` card on the customer and sets it as
+  `invoice_settings.default_payment_method`,
 - creates the associated events: `payment_intent.succeeded` (payment mode),
-  `customer.subscription.created` (subscription mode), and
+  `customer.subscription.created` + `invoice.paid` (subscription mode), and
   `checkout.session.completed`.
 
 Because state and events commit before the response returns, you can retrieve
-the session and list events immediately afterwards.
+the session and list events immediately afterwards. The saved card is readable
+through `GET /v1/customers/{id}?expand[]=invoice_settings.default_payment_method`,
+`GET /v1/customers/{id}/payment_methods`, or `GET /v1/payment_methods/{id}`.
 
 On success the browser is redirected to `success_url` with
 `{CHECKOUT_SESSION_ID}` substituted; a declined simulation leaves the session

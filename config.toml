@@ -20,6 +20,10 @@ business_type = "company"
 country = "US"
 email = "owner@example.com"
 name = "Mock Platform"
+# Optional fixed keys. When set, they are used instead of generated keys and are
+# re-applied after every /internal/reset, so tests can hard-code one value.
+# secret_key = "sk_test_stateleo"
+# publishable_key = "pk_test_stateleo"
 
 # Event destinations are the single webhook concept, mirroring Stripe's
 # v2.core.event_destination object. Each destination chooses:
@@ -27,6 +31,7 @@ name = "Mock Platform"
 #   events_from:    ["@self"] (your account) and/or ["@accounts"] (connected)
 #   enabled_events: ["*"] or exact names / "prefix.*" patterns
 #   webhook_endpoint.url: the delivery URL
+#   webhook_endpoint.signing_secret: optional fixed whsec_ value (shared per URL)
 # To receive both snapshot and thin events, declare two destinations -- exactly
 # like registering a separate endpoint per payload format in Stripe.
 

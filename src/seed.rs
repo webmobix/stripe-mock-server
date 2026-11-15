@@ -17,7 +17,7 @@ pub async fn seed(pool: &SqlitePool, config: &Config) -> Result<(), sqlx::Error>
     let main = seed_main_account(pool, config).await?;
     seed_static_checkout_session(pool, &main, &config.base_url()).await?;
     seed_event_destinations(pool, config, &main).await?;
-    normalize_destination_secrets(pool).await?;
+    normalize_destination_secrets(pool, config).await?;
     Ok(())
 }
 
@@ -82,7 +82,11 @@ pub async fn seed_static_checkout_session(
             amount_total = excluded.amount_total,
             currency = excluded.currency,
             url = excluded.url,
-            metadata = '{}'",
+            metadata = '{}',
+            ui_mode = 'hosted_page',
+            return_url = NULL,
+            client_secret = NULL,
+            subscription_metadata = NULL",
     )
     .bind(STATIC_CHECKOUT_ID)
     .bind(account_id)
@@ -99,13 +103,19 @@ pub async fn seed_static_checkout_session(
 
 /// Enforce one signing secret per endpoint URL across every destination, including
 /// rows created before this rule or directly through the v2 API. Destinations that
-/// share a `url` therefore verify webhooks with the same `whsec_` secret.
-pub async fn normalize_destination_secrets(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+/// share a `url` therefore verify webhooks with the same `whsec_` secret. A
+/// secret configured for the URL wins over the URL-derived default.
+pub async fn normalize_destination_secrets(
+    pool: &SqlitePool,
+    config: &Config,
+) -> Result<(), sqlx::Error> {
     let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, url FROM event_destinations")
         .fetch_all(pool)
         .await?;
     for (id, url) in rows {
-        let secret = ids::webhook_secret_for_url(&url);
+        let secret = config
+            .signing_secret_for_url(&url)
+            .unwrap_or_else(|| ids::webhook_secret_for_url(&url));
         sqlx::query("UPDATE event_destinations SET secret = ?1 WHERE id = ?2 AND secret <> ?1")
             .bind(&secret)
             .bind(&id)
@@ -121,7 +131,13 @@ pub async fn seed_main_account(pool: &SqlitePool, config: &Config) -> Result<Str
             .fetch_optional(pool)
             .await?
     {
-        ensure_keys(pool, &id).await?;
+        ensure_keys(
+            pool,
+            &id,
+            config.main_account.secret_key.as_deref(),
+            config.main_account.publishable_key.as_deref(),
+        )
+        .await?;
         return Ok(id);
     }
 
@@ -168,7 +184,13 @@ pub async fn seed_main_account(pool: &SqlitePool, config: &Config) -> Result<Str
     .execute(pool)
     .await?;
 
-    ensure_keys(pool, &id).await?;
+    ensure_keys(
+        pool,
+        &id,
+        config.main_account.secret_key.as_deref(),
+        config.main_account.publishable_key.as_deref(),
+    )
+    .await?;
     Ok(id)
 }
 
@@ -228,33 +250,66 @@ pub async fn seed_connected_account(
     .execute(pool)
     .await?;
 
-    ensure_keys(pool, &id).await?;
+    ensure_keys(pool, &id, None, None).await?;
     Ok(id)
 }
 
 /// Ensure both a secret and a publishable key exist for the account.
-pub async fn ensure_keys(pool: &SqlitePool, account_id: &str) -> Result<(), sqlx::Error> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE account_id = ?1")
-        .bind(account_id)
-        .fetch_one(pool)
-        .await?;
-    if count > 0 {
-        return Ok(());
-    }
-    let now = time::now_epoch();
-    for (key, kind) in [
-        (ids::secret_key(), "secret"),
-        (ids::publishable_key(), "publishable"),
-    ] {
-        sqlx::query(
-            "INSERT INTO api_keys (key, account_id, kind, created) VALUES (?1, ?2, ?3, ?4)",
-        )
-        .bind(key)
-        .bind(account_id)
-        .bind(kind)
-        .bind(now)
-        .execute(pool)
-        .await?;
+///
+/// A configured key replaces any previously generated key of the same kind, so
+/// the value set in `[main_account]` survives `/internal/reset` and restarts.
+pub async fn ensure_keys(
+    pool: &SqlitePool,
+    account_id: &str,
+    secret_key: Option<&str>,
+    publishable_key: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    for (kind, configured) in [("secret", secret_key), ("publishable", publishable_key)] {
+        match configured {
+            Some(key) => {
+                sqlx::query(
+                    "DELETE FROM api_keys WHERE account_id = ?1 AND kind = ?2 AND key <> ?3",
+                )
+                .bind(account_id)
+                .bind(kind)
+                .bind(key)
+                .execute(pool)
+                .await?;
+                sqlx::query(
+                    "INSERT OR IGNORE INTO api_keys (key, account_id, kind, created) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .bind(key)
+                .bind(account_id)
+                .bind(kind)
+                .bind(time::now_epoch())
+                .execute(pool)
+                .await?;
+            }
+            None => {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM api_keys WHERE account_id = ?1 AND kind = ?2",
+                )
+                .bind(account_id)
+                .bind(kind)
+                .fetch_one(pool)
+                .await?;
+                if count == 0 {
+                    let generated = match kind {
+                        "secret" => ids::secret_key(),
+                        _ => ids::publishable_key(),
+                    };
+                    sqlx::query(
+                        "INSERT INTO api_keys (key, account_id, kind, created) VALUES (?1, ?2, ?3, ?4)",
+                    )
+                    .bind(generated)
+                    .bind(account_id)
+                    .bind(kind)
+                    .bind(time::now_epoch())
+                    .execute(pool)
+                    .await?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -284,6 +339,10 @@ pub async fn seed_event_destinations(
             .as_ref()
             .map(|endpoint| endpoint.url.clone())
             .unwrap_or_default();
+        let configured_secret = destination
+            .webhook_endpoint
+            .as_ref()
+            .and_then(|endpoint| endpoint.signing_secret.clone());
         let existing: Option<String> =
             sqlx::query_scalar("SELECT id FROM event_destinations WHERE account_id = ?1 AND name = ?2 AND event_payload = ?3 LIMIT 1")
                 .bind(owner)
@@ -291,10 +350,21 @@ pub async fn seed_event_destinations(
                 .bind(&destination.event_payload)
                 .fetch_optional(pool)
                 .await?;
-        let secret = ids::webhook_secret_for_url(&url);
+        let secret = configured_secret
+            .clone()
+            .unwrap_or_else(|| ids::webhook_secret_for_url(&url));
         match existing {
             // Keep destinations that already exist so changes made through the API survive restarts.
-            Some(_) => {}
+            Some(id) => {
+                // A configured signing secret always wins over a generated one.
+                if let Some(secret) = &configured_secret {
+                    sqlx::query("UPDATE event_destinations SET secret = ?1 WHERE id = ?2")
+                        .bind(secret)
+                        .bind(&id)
+                        .execute(pool)
+                        .await?;
+                }
+            }
             None => {
                 let id = ids::event_destination_id();
                 sqlx::query(

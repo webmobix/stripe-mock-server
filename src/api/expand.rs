@@ -12,7 +12,9 @@ use std::pin::Pin;
 use serde_json::Value;
 use sqlx::SqlitePool;
 
-use crate::models::{CustomerRow, PaymentIntentRow, PriceRow, ProductRow, SubscriptionRow};
+use crate::models::{
+    CustomerRow, PaymentIntentRow, PaymentMethodRow, PriceRow, ProductRow, SubscriptionRow,
+};
 
 /// Expand every path in `paths` over `value`, returning the modified value.
 pub async fn expand_response(
@@ -85,23 +87,17 @@ fn walk<'a>(
 }
 
 /// Resolve a reference id held in a field named `field`, scoped to the account.
-async fn resolve(
-    pool: &SqlitePool,
-    account_id: &str,
-    field: &str,
-    value: &Value,
-) -> Option<Value> {
+async fn resolve(pool: &SqlitePool, account_id: &str, field: &str, value: &Value) -> Option<Value> {
     let id = value.as_str()?;
     match field {
         "product" if id.starts_with("prod_") => {
-            let row: ProductRow = sqlx::query_as(
-                "SELECT * FROM products WHERE id = ?1 AND account_id = ?2",
-            )
-            .bind(id)
-            .bind(account_id)
-            .fetch_optional(pool)
-            .await
-            .ok()??;
+            let row: ProductRow =
+                sqlx::query_as("SELECT * FROM products WHERE id = ?1 AND account_id = ?2")
+                    .bind(id)
+                    .bind(account_id)
+                    .fetch_optional(pool)
+                    .await
+                    .ok()??;
             Some(row.to_json())
         }
         "price" if id.starts_with("price_") => {
@@ -137,6 +133,16 @@ async fn resolve(
         "payment_intent" if id.starts_with("pi_") => {
             let row: PaymentIntentRow =
                 sqlx::query_as("SELECT * FROM payment_intents WHERE id = ?1 AND account_id = ?2")
+                    .bind(id)
+                    .bind(account_id)
+                    .fetch_optional(pool)
+                    .await
+                    .ok()??;
+            Some(row.to_json())
+        }
+        "payment_method" | "default_payment_method" if id.starts_with("pm_") => {
+            let row: PaymentMethodRow =
+                sqlx::query_as("SELECT * FROM payment_methods WHERE id = ?1 AND account_id = ?2")
                     .bind(id)
                     .bind(account_id)
                     .fetch_optional(pool)
@@ -185,9 +191,18 @@ mod tests {
             }
         });
         value = expand_response(&pool, "acct_1", value, &["items.data.price.product".into()]).await;
-        assert_eq!(value["items"]["data"][0]["price"]["product"]["id"], "prod_1");
-        assert_eq!(value["items"]["data"][0]["price"]["product"]["object"], "product");
-        assert_eq!(value["items"]["data"][1]["price"]["product"]["id"], "prod_1");
+        assert_eq!(
+            value["items"]["data"][0]["price"]["product"]["id"],
+            "prod_1"
+        );
+        assert_eq!(
+            value["items"]["data"][0]["price"]["product"]["object"],
+            "product"
+        );
+        assert_eq!(
+            value["items"]["data"][1]["price"]["product"]["id"],
+            "prod_1"
+        );
     }
 
     #[tokio::test]

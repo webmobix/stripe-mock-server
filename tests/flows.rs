@@ -957,9 +957,7 @@ async fn expansion_embeds_referenced_products() {
 
     let listed_by_envelope: Value = server
         .client
-        .get(server.url(
-            "/v1/prices?lookup_keys[]=normal_monthly_flat&expand[]=data.product",
-        ))
+        .get(server.url("/v1/prices?lookup_keys[]=normal_monthly_flat&expand[]=data.product"))
         .header("Authorization", format!("Bearer {key}"))
         .send()
         .await
@@ -968,10 +966,7 @@ async fn expansion_embeds_referenced_products() {
         .await
         .unwrap();
     assert_eq!(listed_by_envelope["data"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        listed_by_envelope["data"][0]["product"]["id"],
-        product_id
-    );
+    assert_eq!(listed_by_envelope["data"][0]["product"]["id"], product_id);
     assert_eq!(
         listed_by_envelope["data"][0]["product"]["object"],
         "product"
@@ -1030,9 +1025,7 @@ async fn expansion_embeds_referenced_products() {
 
     let listed: Value = server
         .client
-        .get(server.url(
-            "/v1/subscriptions?expand[]=data.items.data.price.product",
-        ))
+        .get(server.url("/v1/subscriptions?expand[]=data.items.data.price.product"))
         .header("Authorization", format!("Bearer {key}"))
         .send()
         .await
@@ -1057,9 +1050,7 @@ async fn expansion_embeds_referenced_products() {
 
     let listed_item_relative: Value = server
         .client
-        .get(server.url(
-            "/v1/subscriptions?expand[]=items.data.price.product",
-        ))
+        .get(server.url("/v1/subscriptions?expand[]=items.data.price.product"))
         .header("Authorization", format!("Bearer {key}"))
         .send()
         .await
@@ -1384,11 +1375,7 @@ async fn coupons_crud_validation_and_isolation() {
 
     // Percentage bounds.
     for value in ["0", "101"] {
-        let response = post_coupon(
-            vec![("percent_off".into(), value.into())],
-            None,
-        )
-        .await;
+        let response = post_coupon(vec![("percent_off".into(), value.into())], None).await;
         assert_eq!(response.status(), 400, "percent_off {value} was accepted");
         let body: Value = response.json().await.unwrap();
         assert_eq!(body["error"]["param"], "percent_off");
@@ -2092,7 +2079,10 @@ async fn subscription_updates_canceled_retrieval_and_prorations() {
         .unwrap();
     assert!(!events["data"].as_array().unwrap().is_empty());
     assert_eq!(events["data"][0]["data"]["object"]["id"], subscription_id);
-    assert_eq!(events["data"][0]["data"]["object"]["items"]["data"][0]["quantity"], 4);
+    assert_eq!(
+        events["data"][0]["data"]["object"]["items"]["data"][0]["quantity"],
+        4
+    );
 
     // A canceled subscription stays retrievable and in the list.
     let canceled: Value = server
@@ -2624,7 +2614,10 @@ async fn checkout_discounts_taxes_and_totals() {
     let override_session: Value = create_session(vec![
         ("mode".into(), "payment".into()),
         ("line_items[0][price]".into(), price_id.clone()),
-        ("line_items[0][tax_rates][]".into(), exclusive_twenty_id.clone()),
+        (
+            "line_items[0][tax_rates][]".into(),
+            exclusive_twenty_id.clone(),
+        ),
         ("line_items[1][price]".into(), price_id.clone()),
         ("tax_rates[]".into(), exclusive_id.clone()),
     ])

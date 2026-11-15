@@ -246,27 +246,54 @@ pub struct PriceRow {
     pub created: i64,
     pub metadata: Option<String>,
     pub lookup_key: Option<String>,
+    pub billing_scheme: String,
+    pub tiers: Option<String>,
+    pub tiers_mode: Option<String>,
+    pub usage_type: Option<String>,
+    pub meter_id: Option<String>,
 }
 
 impl PriceRow {
+    /// `licensed` unless the price explicitly tracks usage.
+    pub fn usage_type(&self) -> &str {
+        self.usage_type.as_deref().unwrap_or("licensed")
+    }
+
+    pub fn is_metered(&self) -> bool {
+        self.usage_type() == "metered"
+    }
+
+    /// The stored pricing tiers, if this is a tiered price.
+    pub fn tier_list(&self) -> Vec<Value> {
+        parse_json(&self.tiers)
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn to_json(&self) -> Value {
         let recurring = if self.price_type == "recurring" {
             json!({
                 "interval": self.recurring_interval,
                 "interval_count": self.recurring_interval_count.unwrap_or(1),
-                "meter": null,
+                "meter": self.meter_id,
                 "trial_period_days": null,
-                "usage_type": "licensed",
+                "usage_type": self.usage_type(),
             })
         } else {
             Value::Null
         };
         let unit_amount_decimal = self.unit_amount.map(|a| format!("{a}"));
+        let tiers = if self.billing_scheme == "tiered" {
+            Value::Array(self.tier_list())
+        } else {
+            Value::Null
+        };
         json!({
             "id": self.id,
             "object": "price",
             "active": self.active != 0,
-            "billing_scheme": "per_unit",
+            "billing_scheme": self.billing_scheme,
             "created": self.created,
             "currency": self.currency,
             "livemode": false,
@@ -275,6 +302,8 @@ impl PriceRow {
             "nickname": self.nickname,
             "product": self.product_id,
             "recurring": recurring,
+            "tiers": tiers,
+            "tiers_mode": self.tiers_mode,
             "type": self.price_type,
             "unit_amount": self.unit_amount,
             "unit_amount_decimal": unit_amount_decimal,
@@ -292,16 +321,32 @@ pub struct CustomerRow {
     pub created: i64,
     pub tax_ids: Option<String>,
     pub metadata: Option<String>,
+    pub invoice_settings: Option<String>,
 }
 
 impl CustomerRow {
+    /// The customer's default payment method id, when one is attached.
+    pub fn default_payment_method(&self) -> Option<String> {
+        parse_json(&self.invoice_settings)
+            .get("default_payment_method")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
     pub fn to_json(&self) -> Value {
+        let invoice_settings = parse_json(&self.invoice_settings);
         json!({
             "id": self.id,
             "object": "customer",
             "created": self.created,
             "currency": self.currency,
             "email": self.email,
+            "invoice_settings": {
+                "custom_fields": invoice_settings.get("custom_fields").cloned().unwrap_or(Value::Null),
+                "default_payment_method": self.default_payment_method(),
+                "footer": invoice_settings.get("footer").cloned().unwrap_or(Value::Null),
+                "rendering_options": invoice_settings.get("rendering_options").cloned().unwrap_or(Value::Null),
+            },
             "livemode": false,
             "metadata": parse_json_or_empty(&self.metadata),
             "name": self.name,
@@ -327,6 +372,69 @@ pub fn tax_id_entry(id: &str, tax_type: &str, value: &str, created: i64) -> Valu
         "livemode": false,
         "type": tax_type,
         "value": value,
+    })
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PaymentMethodRow {
+    pub id: String,
+    pub account_id: String,
+    pub customer: Option<String>,
+    pub pm_type: String,
+    pub card: Option<String>,
+    pub billing_details: Option<String>,
+    pub metadata: Option<String>,
+    pub created: i64,
+}
+
+impl PaymentMethodRow {
+    pub fn to_json(&self) -> Value {
+        let mut obj = empty_object();
+        obj.insert("id".into(), json!(self.id));
+        obj.insert("object".into(), json!("payment_method"));
+        obj.insert("type".into(), json!(self.pm_type));
+        obj.insert("created".into(), json!(self.created));
+        obj.insert("livemode".into(), json!(false));
+        obj.insert("customer".into(), json!(self.customer));
+        obj.insert("customer_account".into(), Value::Null);
+        obj.insert("allow_redisplay".into(), json!("unspecified"));
+        obj.insert(
+            "billing_details".into(),
+            match parse_json(&self.billing_details) {
+                Value::Object(map) => Value::Object(map),
+                _ => json!({
+                    "address": null,
+                    "email": null,
+                    "name": null,
+                    "phone": null,
+                }),
+            },
+        );
+        obj.insert("metadata".into(), parse_json_or_empty(&self.metadata));
+        if self.pm_type == "card" {
+            obj.insert("card".into(), parse_json(&self.card));
+        }
+        Value::Object(obj)
+    }
+}
+
+/// Build a card payment method payload for the mock's checkout card.
+pub fn card_payment_method_card(brand: &str, last4: &str, exp_month: i64, exp_year: i64) -> Value {
+    json!({
+        "brand": brand,
+        "checks": null,
+        "country": "US",
+        "display_brand": brand,
+        "exp_month": exp_month,
+        "exp_year": exp_year,
+        "fingerprint": null,
+        "funding": "credit",
+        "generated_from": null,
+        "last4": last4,
+        "networks": null,
+        "regulated_status": null,
+        "three_d_secure_usage": null,
+        "wallet": null,
     })
 }
 
@@ -551,9 +659,25 @@ pub struct CheckoutSessionRow {
     pub currency: Option<String>,
     pub url: Option<String>,
     pub metadata: Option<String>,
+    pub ui_mode: String,
+    pub return_url: Option<String>,
+    pub client_secret: Option<String>,
+    pub subscription_metadata: Option<String>,
 }
 
 impl CheckoutSessionRow {
+    pub fn is_embedded(&self) -> bool {
+        self.ui_mode == "embedded_page" || self.ui_mode == "elements"
+    }
+
+    /// Metadata applied to the subscription created on completion.
+    pub fn subscription_metadata(&self) -> Value {
+        match parse_json(&self.subscription_metadata) {
+            Value::Object(map) => Value::Object(map),
+            _ => json!({}),
+        }
+    }
+
     /// The applied coupon snapshots stored on the session.
     pub fn discounts(&self) -> Vec<Value> {
         parse_json(&self.discounts)
@@ -649,14 +773,17 @@ impl CheckoutSessionRow {
             "customer_email": self.customer_email,
             "discounts": stored_discounts,
             "expires_at": self.expires_at,
+            "client_secret": self.client_secret,
             "livemode": false,
             "metadata": parse_json_or_empty(&self.metadata),
             "mode": self.mode,
             "payment_intent": self.payment_intent,
             "payment_status": if self.status == "complete" { "paid" } else { "unpaid" },
+            "return_url": self.return_url,
             "status": self.status,
             "subscription": self.subscription,
             "success_url": self.success_url,
+            "ui_mode": self.ui_mode,
             "total_details": {
                 "amount_discount": amount_discount,
                 "amount_tax": amount_tax,
@@ -705,6 +832,13 @@ pub struct InvoiceRow {
     pub customer_tax_ids: String,
     pub description: Option<String>,
     pub metadata: Option<String>,
+    pub subscription: Option<String>,
+    pub billing_reason: Option<String>,
+    pub period_start: Option<i64>,
+    pub period_end: Option<i64>,
+    pub collection_method: String,
+    pub attempt_count: i64,
+    pub payment_intent: Option<String>,
 }
 
 impl InvoiceRow {
@@ -722,12 +856,15 @@ impl InvoiceRow {
             "object": "invoice",
             "account_country": "US",
             "amount_due": self.amount_due,
+            "amount_overpaid": 0,
             "amount_paid": self.amount_paid,
             "amount_remaining": self.remaining(),
-            "attempt_count": 0,
+            "attempt_count": self.attempt_count,
             "attempted": self.attempted(),
             "auto_advance": false,
-            "collection_method": "send_invoice",
+            "automatic_tax": { "enabled": false, "status": null },
+            "billing_reason": self.billing_reason,
+            "collection_method": self.collection_method,
             "created": self.created,
             "currency": self.currency,
             "customer": self.customer,
@@ -750,7 +887,11 @@ impl InvoiceRow {
             "number": Value::Null,
             "paid": self.status == "paid",
             "paid_at": self.paid_at,
+            "payment_intent": self.payment_intent,
+            "period_end": self.period_end,
+            "period_start": self.period_start,
             "status": self.status,
+            "subscription": self.subscription,
             "subtotal": self.subtotal,
             "tax_total": self.tax_total,
             "total": self.total,
@@ -786,7 +927,7 @@ impl InvoiceRow {
 
     /// Whether the invoice has been attempted at least once.
     fn attempted(&self) -> bool {
-        self.status == "paid" || self.status == "uncollectible"
+        self.attempt_count > 0 || self.status == "paid" || self.status == "uncollectible"
     }
 }
 
@@ -818,6 +959,84 @@ impl PaymentIntentRow {
             "metadata": parse_json_or_empty(&self.metadata),
             "status": self.status,
         })
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MeterRow {
+    pub id: String,
+    pub account_id: String,
+    pub display_name: String,
+    pub event_name: String,
+    pub aggregation_formula: String,
+    pub customer_payload_key: String,
+    pub value_payload_key: String,
+    pub event_time_window: Option<String>,
+    pub status: String,
+    pub deactivated_at: Option<i64>,
+    pub created: i64,
+    pub updated: i64,
+}
+
+impl MeterRow {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "object": "billing.meter",
+            "created": self.created,
+            "updated": self.updated,
+            "display_name": self.display_name,
+            "event_name": self.event_name,
+            "default_aggregation": { "formula": self.aggregation_formula },
+            "customer_mapping": {
+                "event_payload_key": self.customer_payload_key,
+                "type": "by_id",
+            },
+            "value_settings": { "event_payload_key": self.value_payload_key },
+            "event_time_window": self.event_time_window,
+            "livemode": false,
+            "status": self.status,
+            "status_transitions": { "deactivated_at": self.deactivated_at },
+        })
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MeterEventRow {
+    pub id: String,
+    pub account_id: String,
+    pub meter_id: String,
+    pub event_name: String,
+    pub identifier: String,
+    pub customer: Option<String>,
+    pub payload: String,
+    pub value: f64,
+    pub timestamp: i64,
+    pub created: i64,
+}
+
+impl MeterEventRow {
+    /// The v1 `billing.meter_event` object. Stripe does not expose the internal
+    /// event id on this object; the client-supplied identifier is the key.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "object": "billing.meter_event",
+            "created": self.created,
+            "event_name": self.event_name,
+            "identifier": self.identifier,
+            "livemode": false,
+            "payload": parse_json_or_empty(&Some(self.payload.clone())),
+            "timestamp": self.timestamp,
+        })
+    }
+}
+
+/// Render an aggregated number without a trailing `.0` when it is whole.
+pub fn usage_number(value: f64) -> Value {
+    if value.fract() == 0.0 {
+        json!(value as i64)
+    } else {
+        json!(value)
     }
 }
 
@@ -1053,6 +1272,7 @@ mod tests {
             created: 10,
             tax_ids: Some(tax_ids.into()),
             metadata: Some("{}".into()),
+            invoice_settings: None,
         }
     }
 
@@ -1083,6 +1303,10 @@ mod tests {
             currency: Some("usd".into()),
             url: None,
             metadata: Some("{}".into()),
+            ui_mode: "hosted_page".into(),
+            return_url: None,
+            client_secret: None,
+            subscription_metadata: None,
         }
     }
 
@@ -1126,8 +1350,14 @@ mod tests {
         assert_eq!(json["amount_tax"], 150);
         assert_eq!(json["amount_total"], 1650);
         assert_eq!(json["total_details"]["amount_discount"], 500);
-        assert_eq!(json["total_details"]["breakdown"]["discounts"][0]["coupon"], "coupon_1");
-        assert_eq!(json["total_details"]["breakdown"]["discounts"][0]["amount"], 500);
+        assert_eq!(
+            json["total_details"]["breakdown"]["discounts"][0]["coupon"],
+            "coupon_1"
+        );
+        assert_eq!(
+            json["total_details"]["breakdown"]["discounts"][0]["amount"],
+            500
+        );
         let taxes = json["total_details"]["breakdown"]["taxes"]
             .as_array()
             .unwrap();
@@ -1169,7 +1399,10 @@ mod tests {
         assert_eq!(json["id"], "bps_1");
         assert_eq!(json["customer"], "cus_1");
         assert_eq!(json["return_url"], "https://example.com/account");
-        assert_eq!(json["url"], "http://127.0.0.1:12111/mock/billing-portal/bps_1");
+        assert_eq!(
+            json["url"],
+            "http://127.0.0.1:12111/mock/billing-portal/bps_1"
+        );
         assert_eq!(json["created"], 10);
     }
 
@@ -1229,6 +1462,13 @@ mod tests {
             customer_tax_ids: "[]".into(),
             description: None,
             metadata: Some("{}".into()),
+            subscription: None,
+            billing_reason: None,
+            period_start: None,
+            period_end: None,
+            collection_method: "send_invoice".into(),
+            attempt_count: 0,
+            payment_intent: None,
         }
     }
 
@@ -1256,7 +1496,11 @@ mod tests {
         assert_eq!(json["lines"]["url"], "/v1/invoices/in_1/lines");
     }
 
-    fn coupon(times_redeemed: i64, max_redemptions: Option<i64>, redeem_by: Option<i64>) -> CouponRow {
+    fn coupon(
+        times_redeemed: i64,
+        max_redemptions: Option<i64>,
+        redeem_by: Option<i64>,
+    ) -> CouponRow {
         CouponRow {
             id: "coupon_1".into(),
             account_id: "acct_1".into(),
@@ -1385,6 +1629,11 @@ mod tests {
             created: 10,
             metadata: Some("{}".into()),
             lookup_key: None,
+            billing_scheme: "per_unit".into(),
+            tiers: None,
+            tiers_mode: None,
+            usage_type: None,
+            meter_id: None,
         };
         assert_eq!(row.to_json()["lookup_key"], Value::Null);
         row.lookup_key = Some("pro_monthly".into());

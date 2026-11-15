@@ -66,6 +66,36 @@ pub fn payment_intent_id() -> String {
     id("pi_")
 }
 
+pub fn payment_method_id() -> String {
+    id("pm_")
+}
+
+/// Billing meter identifier.
+pub fn meter_id() -> String {
+    id("mtr_")
+}
+
+/// Generated meter event identifier when the caller omits one.
+pub fn meter_event_identifier() -> String {
+    id("idmp_")
+}
+
+/// Stable id for a meter event summary bucket.
+pub fn meter_event_summary_id(meter: &str, customer: &str, start: i64, end: i64) -> String {
+    let digest = Sha256::digest(format!("{meter}:{customer}:{start}:{end}").as_bytes());
+    format!("mtrusg_{}", &hex::encode(digest)[..32])
+}
+
+/// The client secret of an embedded Checkout Session.
+pub fn checkout_client_secret(session_id: &str) -> String {
+    format!("{session_id}_secret_{}", random_string(24))
+}
+
+/// A preview invoice id, as Stripe returns from `invoices.create_preview`.
+pub fn invoice_preview_id() -> String {
+    id("upcoming_in_")
+}
+
 pub fn event_id() -> String {
     id("evt_")
 }

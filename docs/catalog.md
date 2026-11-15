@@ -42,6 +42,54 @@ A `price` has a `price_` id, `currency`, `unit_amount`, `type`
 (`one_time`/`recurring`), and an optional `recurring.interval`. Creating a price
 updates the product's `default_price`.
 
+## Metered prices
+
+A recurring price can charge for reported usage instead of a fixed quantity. It
+names a billing meter (`mtr_...`) created through
+[`/v1/billing/meters`](meters.md) and reports `recurring.usage_type=metered`:
+
+```bash
+curl -s -X POST $BASE/v1/prices \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode "product=$PID" \
+  --data-urlencode 'currency=usd' \
+  --data-urlencode 'recurring[interval]=month' \
+  --data-urlencode 'recurring[usage_type]=metered' \
+  --data-urlencode "recurring[meter]=$METER_ID" \
+  --data-urlencode 'unit_amount=2'
+```
+
+`unit_amount` is the price per unit of aggregated usage. A quantity on a metered
+subscription item or checkout line is rejected; the item's `quantity` is `null`.
+The mock bills the usage aggregated over the period when the subscription
+advances.
+
+## Tiered prices
+
+Set `billing_scheme=tiered`, a `tiers_mode` of `graduated` or `volume`, and one
+or more `tiers[]`. Each tier has `up_to` (`inf` for the final, unbounded tier)
+and a `unit_amount` and/or `flat_amount`:
+
+```bash
+curl -s -X POST $BASE/v1/prices \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode "product=$PID" \
+  --data-urlencode 'currency=usd' \
+  --data-urlencode 'recurring[interval]=month' \
+  --data-urlencode 'billing_scheme=tiered' \
+  --data-urlencode 'tiers_mode=graduated' \
+  --data-urlencode 'tiers[0][up_to]=10' \
+  --data-urlencode 'tiers[0][unit_amount]=100' \
+  --data-urlencode 'tiers[1][up_to]=inf' \
+  --data-urlencode 'tiers[1][unit_amount]=50'
+```
+
+A `graduated` price bills each band's units at that band's rate; `volume` bills
+the whole quantity at the rate of the band it falls into. Tier amounts accept
+`unit_amount_decimal`/`flat_amount_decimal` as well. Tiered prices report
+`unit_amount: null`, `tiers`, and `tiers_mode`; the mock uses the tiers when
+pricing subscriptions, checkout totals, renewals, and invoice previews.
+
 ## Lookup keys
 
 A price may carry a `lookup_key`, which the consuming app can use instead of an

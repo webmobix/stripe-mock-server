@@ -40,6 +40,13 @@ pub struct MainAccountConfig {
     pub email: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// Fixed secret key for the main account. When unset the mock generates one
+    /// at first boot. A configured key is re-applied after every reset.
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// Fixed publishable key for the main account.
+    #[serde(default)]
+    pub publishable_key: Option<String>,
 }
 
 /// A declarative `v2.core.event_destination`, seeded at boot.
@@ -69,6 +76,11 @@ pub struct EventDestinationConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WebhookEndpointConfig {
     pub url: String,
+    /// Fixed signing secret for this endpoint URL. Destinations that share a
+    /// URL share the secret, so the first configured value wins. When unset the
+    /// mock derives a stable `whsec_` value from the URL.
+    #[serde(default)]
+    pub signing_secret: Option<String>,
 }
 
 fn default_bind() -> String {
@@ -115,7 +127,29 @@ impl Config {
             .to_string()
     }
 
+    /// The configured signing secret for an endpoint URL, when one is declared.
+    pub fn signing_secret_for_url(&self, url: &str) -> Option<String> {
+        self.event_destinations.iter().find_map(|destination| {
+            let endpoint = destination.webhook_endpoint.as_ref()?;
+            if endpoint.url == url {
+                endpoint.signing_secret.clone()
+            } else {
+                None
+            }
+        })
+    }
+
     fn validate(&self) -> Result<(), String> {
+        for key in [
+            &self.main_account.secret_key,
+            &self.main_account.publishable_key,
+        ] {
+            if let Some(key) = key
+                && key.trim().is_empty()
+            {
+                return Err("main_account keys must not be empty".to_string());
+            }
+        }
         for destination in &self.event_destinations {
             if destination.destination_type != "webhook_endpoint" {
                 return Err(format!(
@@ -133,7 +167,18 @@ impl Config {
                 }
             }
             match &destination.webhook_endpoint {
-                Some(endpoint) if !endpoint.url.is_empty() => {}
+                Some(endpoint) if !endpoint.url.is_empty() => {
+                    if endpoint
+                        .signing_secret
+                        .as_deref()
+                        .is_some_and(|secret| secret.trim().is_empty())
+                    {
+                        return Err(format!(
+                            "event destination '{}': webhook_endpoint.signing_secret must not be empty",
+                            destination.name
+                        ));
+                    }
+                }
                 _ => {
                     return Err(format!(
                         "event destination '{}': webhook_endpoint.url is required",

@@ -13,12 +13,15 @@ focused subset of the API across two conventions:
   distinct error envelope.
 
 Object identifiers use real Stripe prefixes (`acct_`, `prod_`, `price_`, `cus_`,
-`txi_`, `in_`, `txr_`, `coupon_`, `sub_`, `cs_test_`, `bps_`, `pi_`, `evt_`,
-`sk_test_`, `pk_test_`, `whsec_`), and state changes create events synchronously
-while webhook delivery stays asynchronous. The v1 API supports price lookup
-keys, `expand[]` response expansion, subscription quantity updates with
-proration figures, coupons and tax rates, checkout discount/tax totals, and
-billing portal sessions with a hosted page.
+`txi_`, `in_`, `txr_`, `coupon_`, `sub_`, `cs_test_`, `bps_`, `pi_`, `pm_`,
+`mtr_`, `evt_`, `sk_test_`, `pk_test_`, `whsec_`), and state changes create
+events synchronously while webhook delivery stays asynchronous. The v1 API
+supports price lookup keys, metered and tiered prices, billing meters,
+`expand[]` response expansion, subscription quantity updates with proration
+figures, renewal invoices, invoice previews, coupons and tax rates, checkout
+discount/tax totals, embedded checkout, and billing portal sessions with a
+hosted page. Configured keys and webhook secrets survive resets, and v1
+mutations honor `Idempotency-Key`.
 
 > **This is a test tool.** It intentionally exposes generated secrets and
 > never talks to real payment networks. Do not run it in production or on a
@@ -253,7 +256,22 @@ Beyond the quickstart, the v1 API also supports:
 - checkout `customer_email`, coupons, tax rates, and the
   subtotal/discount/tax breakdown — see [`docs/checkout.md`](docs/checkout.md);
 - `POST /v1/billing_portal/sessions` and the hosted
-  `/mock/billing-portal/{id}` page — see [`docs/hosted-ui.md`](docs/hosted-ui.md).
+  `/mock/billing-portal/{id}` page — see [`docs/hosted-ui.md`](docs/hosted-ui.md);
+- billing meters and meter events at `/v1/billing/meters` and
+  `/v1/billing/meter_events`, with duplicate identifiers rejected and
+  `/event_summaries` for aggregation — see [`docs/meters.md`](docs/meters.md);
+- metered and graduated/volume tiered prices, with quantities rejected on
+  metered lines — see [`docs/catalog.md`](docs/catalog.md);
+- embedded checkout (`ui_mode=embedded_page`, `return_url`, `client_secret`,
+  `subscription_data.metadata`) and a saved default card after completion — see
+  [`docs/checkout.md`](docs/checkout.md);
+- subscription first and renewal invoices, plus
+  `POST /internal/subscriptions/{id}/advance` for paid/failed renewal and
+  recovery — see [`docs/billing.md`](docs/billing.md);
+- `POST /v1/invoices/create_preview` for the upcoming invoice — see
+  [`docs/invoicing.md`](docs/invoicing.md);
+- `Idempotency-Key` replay on v1 mutations — see
+  [`docs/api-foundations.md`](docs/api-foundations.md).
 
 ## Using the official Stripe SDK
 
@@ -288,9 +306,14 @@ destination and verifies a `v2.core.account.created` thin event with
 `stripe.v2.core.events.retrieve`. It also exercises lookup-key lookup and price
 product expansion, a subscription quantity update with prorations, a billing
 portal session and its hosted page, and a discounted-taxed checkout whose
-payment intent matches the session total. Finally it settles a second invoice
+payment intent matches the session total. It settles a second invoice
 partially through `POST /internal/payment_intents/{id}/resolve` and asserts the
-invoice stays `open` with the remaining balance. It has been run successfully
+invoice stays `open` with the remaining balance. It also creates a billing meter
+and reports usage (asserting a duplicate identifier is rejected and the summary
+aggregates), rejects a quantity on a metered line, previews an upcoming invoice,
+completes an embedded checkout whose subscription carries metadata, reads the
+saved default card through `invoice_settings.default_payment_method`, and
+verifies `Idempotency-Key` replay and conflict. It has been run successfully
 against this build; the recorded result is `E2E_SDK_OK`.
 
 ## Testing
@@ -336,8 +359,9 @@ Hub may create it on first push when the token has permission).
 
 - [`docs/api-foundations.md`](docs/api-foundations.md) — auth, versions, envelopes, ids, timestamps, form parsing, response expansion.
 - [`docs/accounts.md`](docs/accounts.md) — v2 accounts, `include`/default-null, v1 projection, account links, onboarding.
-- [`docs/catalog.md`](docs/catalog.md) — products, prices, lookup keys, and product expansion.
-- [`docs/billing.md`](docs/billing.md) — customers, subscriptions, updates, prorations, and billing portal sessions.
+- [`docs/catalog.md`](docs/catalog.md) — products, prices, lookup keys, metered/tiered prices, and product expansion.
+- [`docs/meters.md`](docs/meters.md) — billing meters, meter events, event summaries, and usage pricing.
+- [`docs/billing.md`](docs/billing.md) — customers, subscriptions, updates, prorations, renewals, and billing portal sessions.
 - [`docs/coupons.md`](docs/coupons.md) — coupons, their validation rules, and redemption.
 - [`docs/tax-rates.md`](docs/tax-rates.md) — tax rates and their filters.
 - [`docs/invoicing.md`](docs/invoicing.md) — invoices, invoice lifecycle, and payment intents.
@@ -350,12 +374,12 @@ Hub may create it on first push when the token has permission).
 ## Out of scope (future work)
 
 Non-webhook event destination transports (Amazon EventBridge, Azure Event Grid),
-directly usable connected-account keys, server-side time advance / billing
-renewals, full v2 onboarding (`account_tokens` + `persons`), promotion codes and
-coupon updates, subscription item add/remove/price-swap, invoice creation for
-prorations, billing portal configuration or cancellation controls, Stripe Tax
-address resolution / `automatic_tax`, `invoiceitems`, idempotency keys,
-concurrent per-event delivery, and endpoints beyond the implemented subset. See
+directly usable connected-account keys, full v2 onboarding (`account_tokens` +
+`persons`), promotion codes and coupon updates, subscription item
+add/remove/price-swap, invoice creation for prorations, billing portal
+configuration or cancellation controls, Stripe Tax address resolution /
+`automatic_tax`, `invoiceitems`, concurrent per-event delivery, and endpoints
+beyond the implemented subset. See
 `openspec/changes/archive/2026-10-09-build-stripe-mock/design.md` for the
 deferred list.
 

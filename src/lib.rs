@@ -6,6 +6,7 @@ pub mod dispatch;
 pub mod error;
 pub mod events;
 pub mod form;
+pub mod idempotency;
 pub mod ids;
 pub mod internal;
 pub mod mock;
@@ -139,8 +140,52 @@ pub fn build_router(state: AppState) -> Router {
             post(api::v1::create_billing_portal_session),
         )
         .route(
+            "/v1/billing/meters",
+            post(api::meters::create_meter).get(api::meters::list_meters),
+        )
+        .route(
+            "/v1/billing/meters/{id}",
+            get(api::meters::get_meter).post(api::meters::update_meter),
+        )
+        .route(
+            "/v1/billing/meters/{id}/deactivate",
+            post(api::meters::deactivate_meter),
+        )
+        .route(
+            "/v1/billing/meters/{id}/reactivate",
+            post(api::meters::reactivate_meter),
+        )
+        .route(
+            "/v1/billing/meters/{id}/event_summaries",
+            get(api::meters::list_event_summaries),
+        )
+        .route(
+            "/v1/billing/meter_events",
+            post(api::meters::create_meter_event),
+        )
+        .route(
+            "/v1/payment_methods/{id}",
+            get(api::payment_methods::get_payment_method),
+        )
+        .route(
+            "/v1/customers/{id}/payment_methods",
+            get(api::payment_methods::list_customer_payment_methods),
+        )
+        .route(
+            "/v1/customers/{id}/payment_methods/{payment_method}",
+            get(api::payment_methods::get_customer_payment_method),
+        )
+        .route(
             "/v1/invoices",
             post(api::invoicing::create_invoice).get(api::invoicing::list_invoices),
+        )
+        .route(
+            "/v1/invoices/create_preview",
+            post(api::invoicing::create_invoice_preview),
+        )
+        .route(
+            "/v1/invoices/upcoming",
+            get(api::invoicing::upcoming_invoice),
         )
         .route(
             "/v1/invoices/{id}",
@@ -254,10 +299,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/mock/checkout/{id}/cancel", get(mock::checkout_cancel))
         .route("/mock/invoices/{id}", get(mock::invoice_page))
         .route("/mock/invoices/{id}/pdf", get(mock::invoice_pdf_page))
-        .route(
-            "/mock/billing-portal/{id}",
-            get(mock::billing_portal_page),
-        )
+        .route("/mock/billing-portal/{id}", get(mock::billing_portal_page))
         // Internal control plane
         .route("/internal/main", get(internal::main_account))
         .route(
@@ -284,7 +326,15 @@ pub fn build_router(state: AppState) -> Router {
             "/internal/payment_intents/{id}/resolve",
             post(internal::resolve_payment_intent),
         )
+        .route(
+            "/internal/subscriptions/{id}/advance",
+            post(internal::advance_subscription),
+        )
         .layer(axum::middleware::from_fn(guard_internal))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            idempotency::enforce,
+        ))
         .layer(axum::middleware::from_fn(log_request))
         .fallback(fallback)
         .with_state(state)

@@ -443,6 +443,119 @@ const postForm = (url, params) =>
   if (settled.amount_remaining !== 500) throw new Error('bad remaining balance');
   if (settled.status !== 'open') throw new Error('invoice status changed on partial payment');
 
+  // --- billing meters, metered pricing, and preview -----------------------
+  const meter = await stripe.billing.meters.create({
+    display_name: 'SDK API calls',
+    event_name: 'sdk_api_call',
+    default_aggregation: { formula: 'sum' },
+  });
+  if (!meter.id.startsWith('mtr_')) throw new Error('bad meter id');
+  console.log('meter', meter.id, meter.status);
+
+  const meterEvent = await stripe.billing.meterEvents.create({
+    event_name: 'sdk_api_call',
+    identifier: 'sdk-usage-1',
+    payload: { stripe_customer_id: taxCustomer.id, value: '12' },
+  });
+  if (meterEvent.identifier !== 'sdk-usage-1') throw new Error('bad meter event');
+  let duplicateMeterEvent = null;
+  try {
+    await stripe.billing.meterEvents.create({
+      event_name: 'sdk_api_call',
+      identifier: 'sdk-usage-1',
+      payload: { stripe_customer_id: taxCustomer.id, value: '12' },
+    });
+  } catch (e) {
+    duplicateMeterEvent = e;
+  }
+  if (!duplicateMeterEvent) throw new Error('duplicate meter event accepted');
+  console.log('duplicate meter event rejected', duplicateMeterEvent.code);
+
+  const now = Math.floor(Date.now() / 1000);
+  const summaryStart = Math.floor(now / 3600) * 3600 - 3600;
+  const summaries = await stripe.billing.meters.listEventSummaries(meter.id, {
+    customer: taxCustomer.id,
+    start_time: summaryStart,
+    end_time: summaryStart + 7200,
+  });
+  const summaryTotal = summaries.data.reduce((total, summary) => total + summary.aggregated_value, 0);
+  if (summaryTotal !== 12) throw new Error(`bad meter summary: ${summaryTotal}`);
+  console.log('meter summary', summaryTotal);
+
+  const meteredPrice = await stripe.prices.create({
+    product: mainProduct.id,
+    currency: 'usd',
+    unit_amount: 3,
+    recurring: { interval: 'month', usage_type: 'metered', meter: meter.id },
+  });
+  if (meteredPrice.recurring.usage_type !== 'metered') throw new Error('bad metered price');
+  let meteredQuantityError = null;
+  try {
+    await stripe.subscriptions.create({
+      customer: taxCustomer.id,
+      items: [{ price: meteredPrice.id, quantity: 2 }],
+    });
+  } catch (e) {
+    meteredQuantityError = e;
+  }
+  if (!meteredQuantityError) throw new Error('metered quantity accepted');
+  console.log('metered quantity rejected', meteredQuantityError.param);
+
+  const meteredSubscription = await stripe.subscriptions.create({
+    customer: taxCustomer.id,
+    items: [{ price: meteredPrice.id }],
+  });
+  if (meteredSubscription.items.data[0].quantity !== null) {
+    throw new Error('metered item carried a quantity');
+  }
+  const preview = await stripe.invoices.createPreview({
+    customer: taxCustomer.id,
+    subscription: meteredSubscription.id,
+  });
+  if (preview.object !== 'invoice' || !preview.id.startsWith('upcoming_in_')) {
+    throw new Error('bad invoice preview');
+  }
+  console.log('invoice preview', preview.id, preview.billing_reason);
+
+  // --- embedded checkout, card on file, idempotency ----------------------
+  const embedded = await stripe.checkout.sessions.create({
+    mode: 'subscription',
+    ui_mode: 'embedded_page',
+    return_url: 'https://example.com/embedded?session={CHECKOUT_SESSION_ID}',
+    customer: taxCustomer.id,
+    line_items: [{ price: mainPrice.id, quantity: 2 }],
+    subscription_data: { metadata: { plan: 'sdk-team' } },
+  });
+  if (!embedded.client_secret || embedded.url !== null) throw new Error('bad embedded session');
+  console.log('embedded session', embedded.id, embedded.ui_mode);
+  const completedEmbedded = await postForm(`${MOCK}/mock/checkout/${embedded.id}`, { card: 'success' });
+  if (completedEmbedded.status !== 303) throw new Error('embedded checkout did not complete');
+  const completedSession = await stripe.checkout.sessions.retrieve(embedded.id);
+  if (completedSession.status !== 'complete') throw new Error('embedded session not complete');
+  const embeddedSubscription = await stripe.subscriptions.retrieve(completedSession.subscription);
+  if (embeddedSubscription.metadata.plan !== 'sdk-team') throw new Error('subscription metadata missing');
+  const cardCustomer = await stripe.customers.retrieve(taxCustomer.id, {
+    expand: ['invoice_settings.default_payment_method'],
+  });
+  const defaultCard = cardCustomer.invoice_settings.default_payment_method;
+  if (defaultCard.card.last4 !== '4242') throw new Error('default card missing');
+  console.log('default card', defaultCard.id, defaultCard.card.brand, defaultCard.card.last4);
+
+  const idemOptions = { idempotencyKey: 'sdk-idempotency-1' };
+  const idemCustomer = await stripe.customers.create({ email: 'sdk-idem@example.com' }, idemOptions);
+  const idemReplay = await stripe.customers.create({ email: 'sdk-idem@example.com' }, idemOptions);
+  if (idemReplay.id !== idemCustomer.id) throw new Error('idempotency replay created a new customer');
+  let idemConflict = null;
+  try {
+    await stripe.customers.create({ email: 'sdk-idem-other@example.com' }, idemOptions);
+  } catch (e) {
+    idemConflict = e;
+  }
+  if (!idemConflict || idemConflict.rawType !== 'idempotency_error') {
+    throw new Error(`idempotency conflict not rejected: ${idemConflict?.rawType ?? idemConflict?.message}`);
+  }
+  console.log('idempotency replay', idemReplay.id, 'conflict', idemConflict.rawType);
+
   // --- verify signatures through the SDK for both scopes ------------------
   const destinations = await (await fetch(`${MOCK}/internal/destinations`)).json();
   const secrets = Object.fromEntries(

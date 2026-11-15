@@ -472,7 +472,10 @@ pub async fn create_event_destination(
         .any(|i| i == "webhook_endpoint.signing_secret");
 
     let id = ids::event_destination_id();
-    let secret = ids::webhook_secret_for_url(&url);
+    let secret = st
+        .config
+        .signing_secret_for_url(&url)
+        .unwrap_or_else(|| ids::webhook_secret_for_url(&url));
     let now = time::now_epoch();
     sqlx::query(
         "INSERT INTO event_destinations (id, account_id, name, description, url, enabled_events, event_payload, events_from, status, metadata, snapshot_api_version, secret, created, updated)
@@ -583,7 +586,10 @@ pub async fn update_event_destination(
         .cloned()
         .unwrap_or_else(|| crate::models::parse_json_or_empty(&existing.metadata));
     let url = get_str(&body, &["webhook_endpoint", "url"]).unwrap_or_else(|| existing.url.clone());
-    let secret = ids::webhook_secret_for_url(&url);
+    let secret = st
+        .config
+        .signing_secret_for_url(&url)
+        .unwrap_or_else(|| ids::webhook_secret_for_url(&url));
     let events_from = match body.get("events_from") {
         Some(value) => Some(validate_events_from(value)?.to_string()),
         None => existing.events_from.clone(),

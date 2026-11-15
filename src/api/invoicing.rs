@@ -334,6 +334,11 @@ fn parse_price_data_request(item: &Value, price_data: &Value) -> Result<LineRequ
             created,
             metadata: Some("{}".to_string()),
             lookup_key: None,
+            billing_scheme: "per_unit".to_string(),
+            tiers: None,
+            tiers_mode: None,
+            usage_type: None,
+            meter_id: None,
         }
         .to_json(),
         ..price
@@ -858,6 +863,7 @@ pub async fn list_invoices(
     .map_err(ApiError::internal)?;
     let customer = get_str(&params, &["customer"]);
     let status = get_str(&params, &["status"]);
+    let subscription = get_str(&params, &["subscription"]);
     let invoices: Vec<InvoiceRow> = invoices
         .into_iter()
         .filter(|i| match &customer {
@@ -866,6 +872,10 @@ pub async fn list_invoices(
         })
         .filter(|i| match &status {
             Some(s) => i.status == *s,
+            None => true,
+        })
+        .filter(|i| match &subscription {
+            Some(s) => i.subscription.as_deref() == Some(s.as_str()),
             None => true,
         })
         .collect();
@@ -895,6 +905,244 @@ pub async fn get_invoice_lines(
         invoice.line_list(),
         false,
     )))
+}
+
+/// The upcoming invoice for a subscription, or a potential subscription, priced
+/// without persisting anything or emitting events.
+async fn preview_invoice(
+    st: &AppState,
+    ctx: &AuthContext,
+    params: &Value,
+) -> Result<Value, ApiError> {
+    let mut subscription = match get_str(params, &["subscription"]) {
+        Some(id) => {
+            let subscription: Option<SubscriptionRow> =
+                sqlx::query_as("SELECT * FROM subscriptions WHERE id = ?1 AND account_id = ?2")
+                    .bind(&id)
+                    .bind(&ctx.account_id)
+                    .fetch_optional(&st.pool)
+                    .await
+                    .map_err(ApiError::internal)?;
+            Some(subscription.ok_or_else(|| {
+                ApiError::invalid_param(v1(), "subscription", format!("No such subscription: {id}"))
+            })?)
+        }
+        None => None,
+    };
+    let customer_id = get_str(params, &["customer"])
+        .or_else(|| subscription.as_ref().and_then(|sub| sub.customer.clone()))
+        .ok_or_else(|| ApiError::missing_param(v1(), "customer"))?;
+    let customer = load_customer(st, &ctx.account_id, &customer_id).await?;
+
+    if subscription.is_none()
+        && get_array(params, &["subscription_details", "items"]).is_none_or(Vec::is_empty)
+    {
+        // With just a customer, preview the next invoice of their most recent
+        // live subscription, as Stripe does.
+        subscription = sqlx::query_as(
+            "SELECT * FROM subscriptions WHERE account_id = ?1 AND customer = ?2
+             AND status IN ('active', 'past_due', 'trialing')
+             ORDER BY created DESC, rowid DESC LIMIT 1",
+        )
+        .bind(&ctx.account_id)
+        .bind(&customer_id)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+
+    let overrides = get_array(params, &["subscription_details", "items"])
+        .cloned()
+        .unwrap_or_default();
+    let mut priced: Vec<(Value, i64)> = Vec::new();
+    if !overrides.is_empty() {
+        for (index, item) in overrides.iter().enumerate() {
+            let price_id = get_str(item, &["price"]).ok_or_else(|| {
+                ApiError::missing_param(
+                    v1(),
+                    &format!("subscription_details[items][{index}][price]"),
+                )
+            })?;
+            let price = load_price(
+                st,
+                &ctx.account_id,
+                &price_id,
+                "subscription_details[items][price]",
+            )
+            .await?;
+            let quantity = if price.is_metered() {
+                if get_str(item, &["quantity"]).is_some() {
+                    return Err(ApiError::invalid_param(
+                        v1(),
+                        "subscription_details[items][quantity]",
+                        "You cannot set a quantity for a metered price",
+                    ));
+                }
+                0
+            } else {
+                parse_quantity(item)?
+            };
+            priced.push((price.to_json(), quantity));
+        }
+    } else if let Some(subscription) = &subscription {
+        for item in parse_json(&Some(subscription.items.clone()))
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            let price = item.get("price").cloned().unwrap_or(Value::Null);
+            let quantity = get_i64(&item, &["quantity"]).unwrap_or(0);
+            priced.push((price, quantity));
+        }
+    }
+
+    let currency = match parse_currency(params)? {
+        Some(currency) => currency,
+        None => priced
+            .iter()
+            .find_map(|(price, _)| get_str(price, &["currency"]))
+            .or_else(|| customer.currency.clone())
+            .unwrap_or_else(|| "usd".to_string()),
+    };
+    let now = time::now_epoch();
+    let (period_start, period_end) = match &subscription {
+        Some(subscription) => {
+            let (interval, count) = crate::api::billing::subscription_interval(subscription);
+            let start = subscription.current_period_end.unwrap_or(now).max(now);
+            (
+                start,
+                crate::api::billing::advance_period(start, &interval, count),
+            )
+        }
+        None => (now, crate::api::billing::advance_period(now, "month", 1)),
+    };
+    let current_period = subscription
+        .as_ref()
+        .map(|subscription| {
+            (
+                subscription.current_period_start.unwrap_or(now),
+                subscription.current_period_end.unwrap_or(now),
+            )
+        })
+        .unwrap_or((now, now));
+
+    let mut lines = Vec::new();
+    let mut subtotal = 0i64;
+    for (price, quantity) in priced {
+        let metered = crate::api::billing::price_is_metered(&price);
+        let (line_start, line_end) = if metered {
+            current_period
+        } else {
+            (period_start, period_end)
+        };
+        let used = if metered {
+            match crate::api::billing::price_meter(&price) {
+                Some(meter) => {
+                    let mut conn = st.pool.acquire().await.map_err(ApiError::internal)?;
+                    crate::api::billing::aggregate_meter_usage(
+                        &mut conn,
+                        &meter,
+                        &customer_id,
+                        current_period.0,
+                        current_period.1,
+                    )
+                    .await
+                    .map_err(ApiError::internal)?
+                }
+                None => 0.0,
+            }
+        } else {
+            quantity as f64
+        };
+        let amount = crate::api::billing::amount_for_quantity(&price, used);
+        subtotal += amount;
+        lines.push(json!({
+            "id": ids::id("il_"),
+            "object": "line_item",
+            "amount": amount,
+            "currency": currency,
+            "description": price.get("nickname").cloned().unwrap_or(Value::Null),
+            "discountable": true,
+            "period": { "start": line_start, "end": line_end },
+            "price": price,
+            "proration": false,
+            "quantity": if metered { crate::models::usage_number(used) } else { json!(quantity) },
+            "subscription": subscription.as_ref().map(|sub| sub.id.clone()),
+            "subscription_item": Value::Null,
+            "tax_amounts": [],
+            "tax_rates": [],
+        }));
+    }
+    let total = subtotal;
+    let invoice = json!({
+        "id": ids::invoice_preview_id(),
+        "object": "invoice",
+        "account_country": "US",
+        "amount_due": total,
+        "amount_overpaid": 0,
+        "amount_paid": 0,
+        "amount_remaining": total,
+        "attempt_count": 0,
+        "attempted": false,
+        "auto_advance": false,
+        "automatic_tax": { "enabled": false, "status": null },
+        "billing_reason": "upcoming",
+        "collection_method": "charge_automatically",
+        "created": now,
+        "currency": currency,
+        "customer": customer_id,
+        "customer_tax_ids": customer.tax_id_list(),
+        "description": null,
+        "due_date": null,
+        "finalized_at": null,
+        "hosted_invoice_url": null,
+        "invoice_pdf": null,
+        "lines": list_envelope("/v1/invoices/upcoming/lines", lines, false),
+        "livemode": false,
+        "metadata": {},
+        "number": null,
+        "paid": false,
+        "paid_at": null,
+        "payment_intent": null,
+        "period_end": period_end,
+        "period_start": period_start,
+        "status": "draft",
+        "subscription": subscription.as_ref().map(|sub| sub.id.clone()),
+        "subtotal": subtotal,
+        "tax_total": 0,
+        "total": total,
+        "updated": now,
+        "voided_at": null,
+    });
+    Ok(crate::api::expand::expand_response(
+        &st.pool,
+        &ctx.account_id,
+        invoice,
+        &crate::api::collect_form_list(params, "expand"),
+    )
+    .await)
+}
+
+/// `POST /v1/invoices/create_preview` (the SDK's `invoices.createPreview`).
+pub async fn create_invoice_preview(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, ApiError> {
+    let ctx = auth(&st, &headers).await?;
+    let params = form::parse_form(&body);
+    Ok(ok(preview_invoice(&st, &ctx, &params).await?))
+}
+
+/// `GET /v1/invoices/upcoming`, the older upcoming-invoice endpoint.
+pub async fn upcoming_invoice(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Result<Response, ApiError> {
+    let ctx = auth(&st, &headers).await?;
+    let params = form::parse_form(query.as_deref().unwrap_or(""));
+    Ok(ok(preview_invoice(&st, &ctx, &params).await?))
 }
 
 /// Delete a draft invoice.
@@ -1676,6 +1924,40 @@ pub async fn resolve_payment_intent(
                         .await
                         .map_err(ApiError::internal)?,
                     );
+                    // Paying a past-due subscription invoice recovers the
+                    // subscription, as it does in Stripe.
+                    if let Some(subscription_id) = &invoice.subscription {
+                        let status: Option<String> =
+                            sqlx::query_scalar("SELECT status FROM subscriptions WHERE id = ?1")
+                                .bind(subscription_id)
+                                .fetch_optional(&mut *tx)
+                                .await
+                                .map_err(ApiError::internal)?;
+                        if status.as_deref() == Some("past_due") {
+                            sqlx::query("UPDATE subscriptions SET status = 'active' WHERE id = ?1")
+                                .bind(subscription_id)
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(ApiError::internal)?;
+                            let subscription: SubscriptionRow =
+                                sqlx::query_as("SELECT * FROM subscriptions WHERE id = ?1")
+                                    .bind(subscription_id)
+                                    .fetch_one(&mut *tx)
+                                    .await
+                                    .map_err(ApiError::internal)?;
+                            event_ids.push(
+                                events::emit(
+                                    &mut tx,
+                                    account_id,
+                                    is_connected,
+                                    "customer.subscription.updated",
+                                    subscription.to_json(),
+                                )
+                                .await
+                                .map_err(ApiError::internal)?,
+                            );
+                        }
+                    }
                 }
                 "failed" => {
                     // A failed payment leaves the invoice amounts and status alone.
@@ -1826,6 +2108,7 @@ mod tests {
             created: 10,
             tax_ids: None,
             metadata: None,
+            invoice_settings: None,
         }
     }
 

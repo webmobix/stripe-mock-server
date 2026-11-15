@@ -288,6 +288,131 @@ pub async fn list_products(
     Ok(ok(list_envelope("/v1/products", data, has_more)))
 }
 
+/// Read an integer amount from a tier, accepting a numeric JSON value or a
+/// numeric string.
+fn tier_amount(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(raw) => raw.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// Parse a decimal amount (`"20.50"`) into minor units.
+fn parse_decimal_amount(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+    if !fraction.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let whole: i64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let mut decimals: Vec<char> = fraction.chars().take(3).collect();
+    while decimals.len() < 3 {
+        decimals.push('0');
+    }
+    let hundredths: i64 = decimals[..2].iter().collect::<String>().parse().ok()?;
+    let thousandths = decimals[2].to_digit(10)? as i64;
+    let minor = whole.checked_mul(100)?.checked_add(hundredths)?;
+    Some(if thousandths >= 5 { minor + 1 } else { minor })
+}
+
+/// Parse the `tiers[]` of a tiered price into Stripe's rendered tier objects.
+fn parse_price_tiers(params: &Value) -> Result<Vec<Value>, ApiError> {
+    let raw = get_array(params, &["tiers"]).cloned().unwrap_or_default();
+    if raw.is_empty() {
+        return Err(ApiError::missing_param(v1(), "tiers"));
+    }
+    let mut tiers = Vec::new();
+    let mut previous_up_to = 0i64;
+    for (index, tier) in raw.iter().enumerate() {
+        let up_to = match tier.get("up_to") {
+            Some(Value::String(raw)) if raw == "inf" => None,
+            Some(value) => match tier_amount(value).filter(|up_to| *up_to > previous_up_to) {
+                Some(up_to) => Some(up_to),
+                None => {
+                    return Err(ApiError::invalid_param(
+                        v1(),
+                        &format!("tiers[{index}][up_to]"),
+                        "Invalid up_to: must be an integer greater than the previous tier",
+                    ));
+                }
+            },
+            None => {
+                return Err(ApiError::missing_param(
+                    v1(),
+                    &format!("tiers[{index}][up_to]"),
+                ));
+            }
+        };
+        if up_to.is_some() && index + 1 == raw.len() {
+            return Err(ApiError::invalid_param(
+                v1(),
+                &format!("tiers[{index}][up_to]"),
+                "The final tier must be unbounded (up_to=inf)",
+            ));
+        }
+
+        let (unit_amount, unit_amount_decimal) =
+            parse_price_tier_amount(tier, "unit_amount", index)?;
+        let (flat_amount, flat_amount_decimal) =
+            parse_price_tier_amount(tier, "flat_amount", index)?;
+        if unit_amount.is_none() && flat_amount.is_none() {
+            return Err(ApiError::invalid_param(
+                v1(),
+                &format!("tiers[{index}]"),
+                "A tier needs a unit_amount or a flat_amount",
+            ));
+        }
+        tiers.push(json!({
+            "flat_amount": flat_amount,
+            "flat_amount_decimal": flat_amount_decimal,
+            "unit_amount": unit_amount,
+            "unit_amount_decimal": unit_amount_decimal,
+            "up_to": up_to,
+        }));
+        if let Some(up_to) = up_to {
+            previous_up_to = up_to;
+        }
+    }
+    Ok(tiers)
+}
+
+fn parse_price_tier_amount(
+    tier: &Value,
+    key: &str,
+    index: usize,
+) -> Result<(Option<i64>, Option<String>), ApiError> {
+    let decimal_key = format!("{key}_decimal");
+    let plain = tier.get(key).and_then(tier_amount);
+    let decimal = get_str(tier, &[&decimal_key]);
+    match (plain, decimal) {
+        (Some(_), Some(_)) => Err(ApiError::invalid_param(
+            v1(),
+            &format!("tiers[{index}][{key}]"),
+            format!("Only one of {key} and {decimal_key} can be set"),
+        )),
+        (Some(amount), None) => Ok((Some(amount), Some(amount.to_string()))),
+        (None, Some(raw)) => {
+            let amount = parse_decimal_amount(&raw).ok_or_else(|| {
+                ApiError::invalid_param(
+                    v1(),
+                    &format!("tiers[{index}][{decimal_key}]"),
+                    "Invalid decimal amount",
+                )
+            })?;
+            Ok((Some(amount), Some(raw)))
+        }
+        (None, None) => Ok((None, None)),
+    }
+}
+
 pub async fn create_price(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -335,6 +460,75 @@ pub async fn create_price(
     } else {
         "one_time"
     };
+    let billing_scheme =
+        get_str(&params, &["billing_scheme"]).unwrap_or_else(|| "per_unit".to_string());
+    if !["per_unit", "tiered"].contains(&billing_scheme.as_str()) {
+        return Err(ApiError::invalid_param(
+            v1(),
+            "billing_scheme",
+            "Invalid billing_scheme: must be per_unit or tiered",
+        ));
+    }
+    let usage_type =
+        get_str(&params, &["recurring", "usage_type"]).unwrap_or_else(|| "licensed".to_string());
+    if !["licensed", "metered"].contains(&usage_type.as_str()) {
+        return Err(ApiError::invalid_param(
+            v1(),
+            "recurring[usage_type]",
+            "Invalid usage_type: must be licensed or metered",
+        ));
+    }
+    if usage_type == "metered" && price_type != "recurring" {
+        return Err(ApiError::invalid_param(
+            v1(),
+            "recurring[usage_type]",
+            "A metered price must be recurring",
+        ));
+    }
+    let meter_id = get_str(&params, &["recurring", "meter"]).filter(|id| !id.is_empty());
+    if usage_type == "metered" && meter_id.is_none() {
+        return Err(ApiError::missing_param(v1(), "recurring.meter"));
+    }
+    if let Some(meter_id) = &meter_id {
+        let meter: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM billing_meters WHERE id = ?1 AND account_id = ?2 AND status = 'active'",
+        )
+        .bind(meter_id)
+        .bind(&ctx.account_id)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        if meter.is_none() {
+            return Err(ApiError::invalid_param(
+                v1(),
+                "recurring[meter]",
+                format!("No active meter: {meter_id}"),
+            ));
+        }
+    }
+    let (tiers, tiers_mode, unit_amount) = if billing_scheme == "tiered" {
+        if unit_amount.is_some() {
+            return Err(ApiError::invalid_param(
+                v1(),
+                "unit_amount",
+                "unit_amount cannot be set when billing_scheme is tiered",
+            ));
+        }
+        let tiers_mode = get_str(&params, &["tiers_mode"])
+            .ok_or_else(|| ApiError::missing_param(v1(), "tiers_mode"))?;
+        if !["graduated", "volume"].contains(&tiers_mode.as_str()) {
+            return Err(ApiError::invalid_param(
+                v1(),
+                "tiers_mode",
+                "Invalid tiers_mode: must be graduated or volume",
+            ));
+        }
+        let tiers = serde_json::to_string(&parse_price_tiers(&params)?)
+            .unwrap_or_else(|_| "[]".to_string());
+        (Some(tiers), Some(tiers_mode), None)
+    } else {
+        (None, None, unit_amount)
+    };
     let lookup_key = get_str(&params, &["lookup_key"]).filter(|key| !key.is_empty());
     let transfer_lookup_key = get_bool(&params, &["transfer_lookup_key"]).unwrap_or(false);
     let id = ids::price_id();
@@ -371,8 +565,9 @@ pub async fn create_price(
     }
     sqlx::query(
         "INSERT INTO prices (id, account_id, product_id, currency, unit_amount, price_type, recurring_interval,
-            recurring_interval_count, nickname, active, created, metadata, lookup_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12)",
+            recurring_interval_count, nickname, active, created, metadata, lookup_key,
+            billing_scheme, tiers, tiers_mode, usage_type, meter_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )
     .bind(&id)
     .bind(&ctx.account_id)
@@ -386,6 +581,11 @@ pub async fn create_price(
     .bind(now)
     .bind(metadata_from(&params).to_string())
     .bind(&lookup_key)
+    .bind(&billing_scheme)
+    .bind(&tiers)
+    .bind(&tiers_mode)
+    .bind(&usage_type)
+    .bind(&meter_id)
     .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
@@ -473,6 +673,21 @@ pub async fn list_prices(
             })
             .collect()
     };
+    let meter_filter = get_str(&params, &["meter"]);
+    let usage_filter = get_str(&params, &["usage_type"]);
+    let prices: Vec<PriceRow> = prices
+        .into_iter()
+        .filter(|price| {
+            meter_filter
+                .as_deref()
+                .is_none_or(|meter| price.meter_id.as_deref() == Some(meter))
+        })
+        .filter(|price| {
+            usage_filter
+                .as_deref()
+                .is_none_or(|usage| price.usage_type() == usage)
+        })
+        .collect();
     let (page, has_more) = paginate(
         prices,
         get_i64(&params, &["limit"]),
@@ -573,6 +788,7 @@ pub async fn get_customer(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Result<Response, ApiError> {
     let ctx = auth(&st, &headers).await?;
     let customer: Option<CustomerRow> =
@@ -584,7 +800,14 @@ pub async fn get_customer(
             .map_err(ApiError::internal)?;
     let customer =
         customer.ok_or_else(|| ApiError::not_found(v1(), format!("No such customer: {id}")))?;
-    Ok(ok(customer.to_json()))
+    let value = expand_response(
+        &st.pool,
+        &ctx.account_id,
+        customer.to_json(),
+        &collect_list_param(query.as_deref().unwrap_or(""), "expand"),
+    )
+    .await;
+    Ok(ok(value))
 }
 
 pub async fn list_customers(
@@ -617,7 +840,10 @@ pub async fn list_customers(
         |c| c.id.clone(),
     );
     let data = page.iter().map(|c| c.to_json()).collect();
-    Ok(ok(list_envelope("/v1/customers", data, has_more)))
+    let envelope = list_envelope("/v1/customers", data, has_more);
+    let expands = collect_list_param(query.as_deref().unwrap_or(""), "expand");
+    let value = expand_list_response(&st.pool, &ctx.account_id, envelope, &expands).await;
+    Ok(ok(value))
 }
 
 pub async fn update_customer(
@@ -804,7 +1030,7 @@ fn parse_quantity(item: &Value) -> Result<i64, ApiError> {
 
 fn build_subscription_item(
     price: &PriceRow,
-    quantity: i64,
+    quantity: Option<i64>,
     subscription_id: &str,
     period_start: i64,
     period_end: i64,
@@ -848,12 +1074,25 @@ pub async fn create_subscription(
     for item in &items {
         let price_id = get_str(item, &["price"])
             .ok_or_else(|| ApiError::missing_param(v1(), "items[][price]"))?;
-        let quantity = parse_quantity(item)?;
         let price = load_price(&st, &ctx.account_id, &price_id, "items[0][price]").await?;
-        built_items.push(build_subscription_item(&price, quantity, &id, now, period_end));
+        let quantity = if price.is_metered() {
+            if get_str(item, &["quantity"]).is_some() {
+                return Err(ApiError::invalid_param(
+                    v1(),
+                    "items[0][quantity]",
+                    "You cannot set a quantity for a metered price",
+                ));
+            }
+            None
+        } else {
+            Some(parse_quantity(item)?)
+        };
+        built_items.push(build_subscription_item(
+            &price, quantity, &id, now, period_end,
+        ));
     }
 
-    let event_id = {
+    let event_ids = {
         let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
         sqlx::query(
             "INSERT INTO subscriptions (id, account_id, customer, customer_account, status, created, current_period_start,
@@ -878,20 +1117,39 @@ pub async fn create_subscription(
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(ApiError::internal)?;
-        let event_id = events::emit(
+        let mut event_ids = vec![
+            events::emit(
+                &mut tx,
+                &ctx.account_id,
+                ctx.is_connected,
+                "customer.subscription.created",
+                subscription.to_json(),
+            )
+            .await
+            .map_err(ApiError::internal)?,
+        ];
+        let (_, invoice_events) = crate::api::billing::raise_subscription_invoice(
             &mut tx,
+            &subscription,
             &ctx.account_id,
             ctx.is_connected,
-            "customer.subscription.created",
-            subscription.to_json(),
+            now,
+            period_end,
+            now,
+            period_end,
+            "subscription_create",
+            true,
+            &st.config.base_url(),
         )
-        .await
-        .map_err(ApiError::internal)?;
+        .await?;
+        event_ids.extend(invoice_events);
         tx.commit().await.map_err(ApiError::internal)?;
-        event_id
+        event_ids
     };
     // The state change is already committed; a failed enqueue must not turn it into a 500.
-    let _ = st.dispatcher.dispatch_event(&event_id).await;
+    for event_id in event_ids {
+        let _ = st.dispatcher.dispatch_event(&event_id).await;
+    }
 
     let subscription: SubscriptionRow = sqlx::query_as("SELECT * FROM subscriptions WHERE id = ?1")
         .bind(&id)
@@ -1151,6 +1409,20 @@ pub async fn update_subscription(
             ));
         };
 
+        if get_str(
+            &stored_items[position],
+            &["price", "recurring", "usage_type"],
+        )
+        .as_deref()
+            == Some("metered")
+        {
+            return Err(ApiError::invalid_param(
+                v1(),
+                &format!("items[{index}][quantity]"),
+                "You cannot set a quantity for a metered price",
+            ));
+        }
+
         if let Some(price_id) = &requested_price_id {
             let item_price = get_str(&stored_items[position], &["price", "id"]);
             if item_price.as_deref() != Some(price_id.as_str()) {
@@ -1163,8 +1435,7 @@ pub async fn update_subscription(
         }
 
         let item_id = get_str(&stored_items[position], &["id"]).unwrap_or_default();
-        let item_price_id =
-            get_str(&stored_items[position], &["price", "id"]).unwrap_or_default();
+        let item_price_id = get_str(&stored_items[position], &["price", "id"]).unwrap_or_default();
         let unit_amount = get_i64(&stored_items[position], &["price", "unit_amount"]).unwrap_or(0);
         let currency = get_str(&stored_items[position], &["price", "currency"])
             .unwrap_or_else(|| "usd".to_string());
@@ -1182,13 +1453,8 @@ pub async fn update_subscription(
         }
 
         if quantity_delta != 0 && proration_behavior != "none" {
-            let amount = proration_amount(
-                unit_amount,
-                quantity_delta,
-                period_start,
-                period_end,
-                now,
-            );
+            let amount =
+                proration_amount(unit_amount, quantity_delta, period_start, period_end, now);
             prorations.push(json!({
                 "id": ids::id("pror_"),
                 "object": "proration",
@@ -1269,11 +1535,11 @@ pub async fn update_subscription(
 // Checkout
 // ---------------------------------------------------------------------------
 
-fn build_line_item(price: &PriceRow, quantity: i64) -> Value {
+fn build_line_item(price: &PriceRow, quantity: Option<i64>, amount_total: i64) -> Value {
     json!({
         "id": ids::id("li_"),
         "object": "item",
-        "amount_total": price.unit_amount.unwrap_or(0).saturating_mul(quantity),
+        "amount_total": amount_total,
         "currency": price.currency,
         "description": price.nickname,
         "price": price.to_json(),
@@ -1384,6 +1650,37 @@ pub async fn create_checkout_session(
     if !["payment", "subscription", "setup"].contains(&mode.as_str()) {
         return Err(ApiError::invalid_param(v1(), "mode", "Invalid mode"));
     }
+    // Stripe's current API calls embedded sessions `embedded_page`; accept the
+    // older `embedded` spelling too.
+    let ui_mode = match get_str(&params, &["ui_mode"]).as_deref() {
+        None | Some("hosted_page") => "hosted_page".to_string(),
+        Some("embedded") | Some("embedded_page") => "embedded_page".to_string(),
+        Some("elements") => "elements".to_string(),
+        Some(other) => {
+            return Err(ApiError::invalid_param(
+                v1(),
+                "ui_mode",
+                format!(
+                    "Invalid ui_mode: {other}. Expected hosted_page, embedded_page, or elements."
+                ),
+            ));
+        }
+    };
+    let return_url = get_str(&params, &["return_url"]);
+    if ui_mode != "hosted_page" && return_url.is_none() {
+        return Err(ApiError::missing_param(v1(), "return_url"));
+    }
+    let subscription_metadata = if mode == "subscription" {
+        match params
+            .get("subscription_data")
+            .and_then(|data| data.get("metadata"))
+        {
+            Some(Value::Object(metadata)) => Value::Object(metadata.clone()),
+            _ => json!({}),
+        }
+    } else {
+        json!({})
+    };
     let now = time::now_epoch();
     let raw_items = get_array(&params, &["line_items"])
         .cloned()
@@ -1394,13 +1691,23 @@ pub async fn create_checkout_session(
     for item in &raw_items {
         let price_id = get_str(item, &["price"])
             .ok_or_else(|| ApiError::missing_param(v1(), "line_items[][price]"))?;
-        let quantity = parse_quantity(item)?;
-        let price = load_price(&st, &ctx.account_id, &price_id, "items[0][price]").await?;
-        let line_amount = price
-            .unit_amount
-            .unwrap_or(0)
-            .checked_mul(quantity)
-            .ok_or_else(|| ApiError::invalid_param(v1(), "line_items", "Amount too large"))?;
+        let price = load_price(&st, &ctx.account_id, &price_id, "line_items[0][price]").await?;
+        let quantity = if price.is_metered() {
+            if get_str(item, &["quantity"]).is_some() {
+                return Err(ApiError::invalid_param(
+                    v1(),
+                    "line_items[0][quantity]",
+                    "You cannot set a quantity for a metered price",
+                ));
+            }
+            None
+        } else {
+            Some(parse_quantity(item)?)
+        };
+        let line_amount = crate::api::billing::amount_for_quantity(
+            &price.to_json(),
+            quantity.unwrap_or(0) as f64,
+        );
         amount_subtotal = amount_subtotal
             .checked_add(line_amount)
             .ok_or_else(|| ApiError::invalid_param(v1(), "line_items", "Amount too large"))?;
@@ -1444,9 +1751,7 @@ pub async fn create_checkout_session(
                 format!("Coupon {coupon_id} is not valid"),
             ));
         }
-        if coupon.amount_off.is_some()
-            && coupon.currency.as_deref() != Some(currency.as_str())
-        {
+        if coupon.amount_off.is_some() && coupon.currency.as_deref() != Some(currency.as_str()) {
             return Err(ApiError::invalid_request(
                 v1(),
                 format!(
@@ -1516,7 +1821,7 @@ pub async fn create_checkout_session(
                 "tax_rate": rate.to_json(),
             }));
         }
-        let mut line = build_line_item(price, *quantity);
+        let mut line = build_line_item(price, *quantity, *line_amount);
         line["tax_rates"] = Value::Array(tax_rate_values);
         line["tax_amounts"] = Value::Array(tax_amounts);
         line_items.push(line);
@@ -1538,7 +1843,16 @@ pub async fn create_checkout_session(
 
     let id = ids::checkout_session_id();
     let expires_at = now + 86_400;
-    let url = format!("{}/mock/checkout/{}", st.config.base_url(), id);
+    let url = if ui_mode == "hosted_page" {
+        Some(format!("{}/mock/checkout/{}", st.config.base_url(), id))
+    } else {
+        None
+    };
+    let client_secret = if ui_mode == "hosted_page" {
+        None
+    } else {
+        Some(ids::checkout_client_secret(&id))
+    };
     let success_url = get_str(&params, &["success_url"]);
     let cancel_url = get_str(&params, &["cancel_url"]);
     let supplied_customer = get_str(&params, &["customer"]);
@@ -1606,8 +1920,10 @@ pub async fn create_checkout_session(
         sqlx::query(
             "INSERT INTO checkout_sessions (id, account_id, mode, status, created, expires_at, success_url, cancel_url,
                 customer, customer_account, customer_email, line_items, payment_intent, subscription, amount_subtotal,
-                amount_total, amount_discount, amount_tax, discounts, currency, url, metadata)
-             VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                amount_total, amount_discount, amount_tax, discounts, currency, url, metadata,
+                ui_mode, return_url, client_secret, subscription_metadata)
+             VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                ?20, ?21, ?22, ?23)",
         )
         .bind(&id)
         .bind(&ctx.account_id)
@@ -1628,6 +1944,10 @@ pub async fn create_checkout_session(
         .bind(&currency)
         .bind(&url)
         .bind(metadata_from(&params).to_string())
+        .bind(&ui_mode)
+        .bind(&return_url)
+        .bind(&client_secret)
+        .bind(subscription_metadata.to_string())
         .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
@@ -1880,9 +2200,6 @@ pub async fn complete_checkout_session(
             let mut items = Vec::new();
             for item in session.line_items() {
                 let price_id = get_str(&item, &["price", "id"]);
-                let quantity = get_i64(&item, &["quantity"])
-                    .filter(|q| *q >= 1)
-                    .unwrap_or(1);
                 if let Some(price_id) = price_id {
                     let price: Option<PriceRow> =
                         sqlx::query_as("SELECT * FROM prices WHERE id = ?1 AND account_id = ?2")
@@ -1892,6 +2209,15 @@ pub async fn complete_checkout_session(
                             .await
                             .map_err(ApiError::internal)?;
                     if let Some(price) = price {
+                        let quantity = if price.is_metered() {
+                            None
+                        } else {
+                            Some(
+                                get_i64(&item, &["quantity"])
+                                    .filter(|q| *q >= 1)
+                                    .unwrap_or(1),
+                            )
+                        };
                         items.push(build_subscription_item(
                             &price, quantity, sub_id, now, period_end,
                         ));
@@ -1901,7 +2227,7 @@ pub async fn complete_checkout_session(
             sqlx::query(
                 "INSERT INTO subscriptions (id, account_id, customer, customer_account, status, created, current_period_start,
                     current_period_end, cancel_at_period_end, items, metadata)
-                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, ?6, 0, ?7, '{}')",
+                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, ?6, 0, ?7, ?8)",
             )
             .bind(sub_id)
             .bind(&account_id)
@@ -1910,6 +2236,7 @@ pub async fn complete_checkout_session(
             .bind(now)
             .bind(period_end)
             .bind(serde_json::to_string(&items).unwrap())
+            .bind(session.subscription_metadata().to_string())
             .execute(&mut *tx)
             .await
             .map_err(ApiError::internal)?;
@@ -1930,6 +2257,28 @@ pub async fn complete_checkout_session(
                 .await
                 .map_err(ApiError::internal)?,
             );
+            let (_, invoice_events) = crate::api::billing::raise_subscription_invoice(
+                &mut tx,
+                &subscription,
+                &account_id,
+                is_connected,
+                now,
+                period_end,
+                now,
+                period_end,
+                "subscription_create",
+                true,
+                &st.config.base_url(),
+            )
+            .await?;
+            event_ids.extend(invoice_events);
+        }
+
+        // A completed checkout saves the simulated card on the customer.
+        if let Some(customer) = &session.customer {
+            crate::api::payment_methods::attach_default_card(&mut tx, &account_id, customer)
+                .await
+                .map_err(ApiError::internal)?;
         }
 
         sqlx::query(
@@ -1979,9 +2328,11 @@ fn parse_percent_off(params: &Value) -> Result<Option<f64>, ApiError> {
     let Some(raw) = get_str(params, &["percent_off"]) else {
         return Ok(None);
     };
-    let percentage = raw.trim().parse::<f64>().ok().ok_or_else(|| {
-        ApiError::invalid_param(v1(), "percent_off", "Invalid percent_off")
-    })?;
+    let percentage = raw
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .ok_or_else(|| ApiError::invalid_param(v1(), "percent_off", "Invalid percent_off"))?;
     if !(percentage > 0.0 && percentage <= 100.0) {
         return Err(ApiError::invalid_param(
             v1(),
@@ -2133,7 +2484,8 @@ pub async fn get_coupon(
             .fetch_optional(&st.pool)
             .await
             .map_err(ApiError::internal)?;
-    let coupon = coupon.ok_or_else(|| ApiError::not_found(v1(), format!("No such coupon: {id}")))?;
+    let coupon =
+        coupon.ok_or_else(|| ApiError::not_found(v1(), format!("No such coupon: {id}")))?;
     Ok(ok(coupon.to_json()))
 }
 
@@ -2175,7 +2527,8 @@ pub async fn delete_coupon(
             .fetch_optional(&st.pool)
             .await
             .map_err(ApiError::internal)?;
-    let coupon = coupon.ok_or_else(|| ApiError::not_found(v1(), format!("No such coupon: {id}")))?;
+    let coupon =
+        coupon.ok_or_else(|| ApiError::not_found(v1(), format!("No such coupon: {id}")))?;
     sqlx::query("DELETE FROM coupons WHERE id = ?1")
         .bind(&id)
         .execute(&st.pool)
@@ -2202,8 +2555,8 @@ pub async fn create_tax_rate(
     let params = form::parse_form(&body);
     let display_name = get_str(&params, &["display_name"])
         .ok_or_else(|| ApiError::missing_param(v1(), "display_name"))?;
-    let inclusive =
-        get_bool(&params, &["inclusive"]).ok_or_else(|| ApiError::missing_param(v1(), "inclusive"))?;
+    let inclusive = get_bool(&params, &["inclusive"])
+        .ok_or_else(|| ApiError::missing_param(v1(), "inclusive"))?;
     let percentage = get_str(&params, &["percentage"])
         .ok_or_else(|| ApiError::missing_param(v1(), "percentage"))?
         .trim()
@@ -2470,10 +2823,7 @@ mod tests {
         let capped = vec![coupon(None, Some(5000))];
         assert_eq!(coupon_discounts(&capped, 2000), vec![2000]);
 
-        let over = vec![
-            coupon(None, Some(1500)),
-            coupon(Some(50.0), None),
-        ];
+        let over = vec![coupon(None, Some(1500)), coupon(Some(50.0), None)];
         assert_eq!(coupon_discounts(&over, 2000), vec![1500, 250]);
     }
 
@@ -2500,5 +2850,4 @@ mod tests {
         assert_eq!(tax_amount(1200, 20.0, true), 200);
         assert_eq!(tax_amount(750, 10.0, false), 75);
     }
-
 }

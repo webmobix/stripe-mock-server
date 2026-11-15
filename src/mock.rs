@@ -553,7 +553,12 @@ async fn static_session(st: &AppState) -> Result<CheckoutSessionRow, sqlx::Error
 }
 
 fn redirect_success(session: &CheckoutSessionRow) -> Response {
-    match &session.success_url {
+    let target = if session.is_embedded() {
+        session.return_url.as_ref()
+    } else {
+        session.success_url.as_ref()
+    };
+    match target {
         Some(url) => {
             Redirect::to(&url.replace("{CHECKOUT_SESSION_ID}", &session.id)).into_response()
         }
@@ -793,10 +798,7 @@ fn format_amount(amount: i64, currency: &str) -> String {
 
 /// The hosted page of a billing portal session. Like the other hosted pages it
 /// is unauthenticated and lists only the session's customer's subscriptions.
-pub async fn billing_portal_page(
-    State(st): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn billing_portal_page(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     let session: Option<BillingPortalSessionRow> =
         sqlx::query_as("SELECT * FROM billing_portal_sessions WHERE id = ?1")
             .bind(&id)
@@ -827,7 +829,12 @@ pub async fn billing_portal_page(
     let customer_email = customer
         .as_ref()
         .and_then(|customer| customer.email.clone())
-        .map(|email| format!("<p class=\"text-sm opacity-70\">{}</p>", crate::util::html_escape(&email)))
+        .map(|email| {
+            format!(
+                "<p class=\"text-sm opacity-70\">{}</p>",
+                crate::util::html_escape(&email)
+            )
+        })
         .unwrap_or_default();
     let subscription_rows = if subscriptions.is_empty() {
         r#"<p id="no-subscriptions" class="opacity-70">This customer has no subscriptions.</p>"#
@@ -836,7 +843,10 @@ pub async fn billing_portal_page(
         let mut rows = String::new();
         for subscription in &subscriptions {
             let json = subscription.to_json();
-            let items = json["items"]["data"].as_array().cloned().unwrap_or_default();
+            let items = json["items"]["data"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             let items_html = items
                 .iter()
                 .map(|item| {

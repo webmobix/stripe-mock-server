@@ -100,12 +100,17 @@ The server SHALL accept form-encoded bodies for `/v1/**` endpoints and JSON bodi
 
 ### Requirement: Response expansion
 
-The server SHALL accept repeated `expand[]` parameters on endpoints that support expansion: query parameters on retrieval and list requests, and form parameters on create and update requests. A path SHALL be dot-separated, SHALL traverse every element of an embedded list, and SHALL replace a reference id with the full object it names.
+The server SHALL accept repeated `expand[]` parameters on endpoints that support expansion: query parameters on retrieval and list requests, and form parameters on create and update requests. A path SHALL be dot-separated, SHALL traverse every element of an embedded list, and SHALL replace a reference id with the full object it names. On list requests, a path SHALL also be resolved relative to the list envelope, so `data.product` expands each item's product.
 
 #### Scenario: Expand a price's product
 
 - **WHEN** a client retrieves a price with `expand[]=product`
 - **THEN** the price's `product` is the full product object instead of its `prod_` id
+
+#### Scenario: Expand a price list through the list envelope
+
+- **WHEN** a client lists prices with `expand[]=data.product`
+- **THEN** every price in `data` has its `product` replaced with the full product object
 
 #### Scenario: Expand a nested subscription price product
 
@@ -116,6 +121,11 @@ The server SHALL accept repeated `expand[]` parameters on endpoints that support
 
 - **WHEN** a client lists a checkout session's line items with `expand[]=data.price.product`
 - **THEN** every line item's `price.product` is the full product object
+
+#### Scenario: Item-relative list path remains supported
+
+- **WHEN** a client lists prices with `expand[]=product`
+- **THEN** every returned price has its `product` replaced with the full product object
 
 #### Scenario: Several expansions at once
 
@@ -131,3 +141,22 @@ The server SHALL accept repeated `expand[]` parameters on endpoints that support
 
 - **WHEN** an expanded reference belongs to another account and is therefore invisible
 - **THEN** the field stays as its original id rather than exposing the other account's object
+
+### Requirement: Idempotency keys
+
+The server SHALL honor an `Idempotency-Key` header on `POST`, `DELETE`, and `PATCH` requests under `/v1/`. Responses SHALL be cached by key, credential, method, path, and body, and replaying the same parameters SHALL return the cached response with `Idempotent-Replay: true`. A different body with the same key SHALL return an `idempotency_error` without running the handler. Server errors SHALL NOT be cached and reset SHALL clear keys.
+
+#### Scenario: Replay a request
+
+- **WHEN** a client repeats a mutation with the same `Idempotency-Key` and body
+- **THEN** the same object is returned and no second object is created
+
+#### Scenario: Conflicting parameters
+
+- **WHEN** a client reuses an `Idempotency-Key` with a different body
+- **THEN** the response is an `idempotency_error` and no handler runs
+
+#### Scenario: Reset clears keys
+
+- **WHEN** a client calls reset and then replays a previously used key
+- **THEN** the request is executed as a new request

@@ -39,6 +39,35 @@ Every request resolves to a target account:
 Objects are scoped to the resolved account; see `docs/catalog.md` for the
 isolation example.
 
+## Idempotency keys
+
+`POST`, `DELETE`, and `PATCH` requests under `/v1/` accept an `Idempotency-Key`
+header. The first response is cached (status, body, and content type) and
+replayed for the same key, credential, method, path, and request body. Replays
+carry `Idempotent-Replay: true`.
+
+```bash
+curl -s -X POST $BASE/v1/customers \
+  -H "Authorization: Bearer $KEY" \
+  -H "Idempotency-Key: customer-1" \
+  -d 'email=buyer@example.com'
+```
+
+Reusing a key with a different body is rejected with Stripe's idempotency
+envelope and no handler runs:
+
+```json
+{
+  "error": {
+    "type": "idempotency_error",
+    "message": "Keys for idempotent requests can only be used with the same parameters they were first used with. ..."
+  }
+}
+```
+
+Keys are scoped to the presented credential and cleared by
+`POST /internal/reset`. Server errors (HTTP 5xx) are not cached.
+
 ## Error envelopes
 
 v1:

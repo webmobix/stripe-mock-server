@@ -89,13 +89,60 @@ The `sub_` object includes `status`, `items.data` (each with an embedded price),
 `customer` (or `customer_account`), and period fields. Every item in
 `items.data` also carries its own `subscription`, `current_period_start`, and
 `current_period_end`, matching the subscription period, on create, retrieve,
-list, and update responses. For an account-backed customer:
+list, and update responses. Creating a subscription also raises its first
+invoice with `billing_reason=subscription_create`, a paid status, and one line
+per item. For an account-backed customer:
 
 ```bash
 curl -s -X POST $BASE/v1/subscriptions \
   -H "Authorization: Bearer $KEY" \
   --data-urlencode "customer_account=acct_..." \
   --data-urlencode "items[0][price]=$PRICE_ID"
+```
+
+### Metered items
+
+A metered price (see [`meters.md`](meters.md)) tracks usage rather than a
+quantity. Omit `items[][quantity]`; supplying one is rejected with
+`invalid_request_error`. The item reports `quantity: null`. Renewal invoices
+bill the usage aggregated over the period that just ended.
+
+## End a billing period
+
+`POST /internal/subscriptions/{id}/advance` ends the current billing period and
+collects the renewal invoice. `outcome` is `paid` or `failed`:
+
+```bash
+curl -s -X POST "$BASE/internal/subscriptions/$SID/advance" \
+  -H 'Content-Type: application/json' \
+  -d '{"outcome":"paid"}'
+```
+
+The response includes the updated `subscription` and the raised `invoice`. A
+paid outcome advances `current_period_start`/`current_period_end`, marks the
+subscription `active`, raises a `subscription_cycle` invoice, and emits
+`invoice.paid` (`invoice.payment_succeeded` too). A failed outcome leaves the
+invoice `open` with `attempt_count=1`, sets the subscription `past_due`, and
+emits `invoice.payment_failed`; the period still advances.
+
+When an `open` invoice already exists, the call **retries that invoice** instead
+of advancing again. Calling it with `outcome=paid` after a failure therefore
+models recovery: the same invoice becomes `paid`, `attempt_count` increments,
+and the subscription returns to `active`.
+
+The full sequence — first invoice, renewal, failure, recovery — is:
+
+```bash
+# Creation raises the first, paid invoice.
+INVOICES=$(curl -s "$BASE/v1/invoices?subscription=$SID" -H "Authorization: Bearer $KEY")
+
+# Renewal fails...
+curl -s -X POST "$BASE/internal/subscriptions/$SID/advance" \
+  -H 'Content-Type: application/json' -d '{"outcome":"failed"}'
+
+# ...then the same open invoice is paid on the retry.
+curl -s -X POST "$BASE/internal/subscriptions/$SID/advance" \
+  -H 'Content-Type: application/json' -d '{"outcome":"paid"}'
 ```
 
 ## Update a subscription

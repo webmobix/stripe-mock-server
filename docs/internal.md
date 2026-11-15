@@ -81,9 +81,9 @@ curl -s -X POST $BASE/internal/deliveries/dl_.../retry
 
 ## Settling a payment intent
 
-The mock has no payment methods, so a test resolves a payment intent through
-the control plane. When the intent references an invoice, the resolution updates
-the invoice's `amount_paid`, `amount_remaining`, and status.
+A test resolves a payment intent through the control plane. When the intent
+references an invoice, the resolution updates the invoice's `amount_paid`,
+`amount_remaining`, and status.
 
 ```bash
 curl -s -X POST $BASE/internal/payment_intents/pi_.../resolve \
@@ -95,6 +95,21 @@ curl -s -X POST $BASE/internal/payment_intents/pi_.../resolve \
 rejected with an `invalid_request_error`. See
 [`invoicing.md`](invoicing.md) for the invoice side of the flow.
 
+## End a subscription billing period
+
+```bash
+curl -s -X POST $BASE/internal/subscriptions/sub_.../advance \
+  -H "Content-Type: application/json" \
+  -d '{"outcome":"paid"}'
+```
+
+`outcome` is `paid` or `failed`. With no open invoice the call advances the
+period, raises a `subscription_cycle` invoice, and sets the subscription
+`active` or `past_due`. With an open invoice it retries that invoice instead, so
+`failed` followed by `paid` models failure and recovery. The response carries
+the updated `subscription` and the `invoice`. See
+[`billing.md`](billing.md#end-a-billing-period).
+
 ## Reset
 
 ```bash
@@ -102,6 +117,7 @@ curl -s -X POST $BASE/internal/reset
 # {"status":"ok"}
 ```
 
-Clears all objects, events, and deliveries and reapplies configuration seeding.
-After a reset only the reseeded main account (with fresh keys) remains; call
-`/internal/main` again to read them.
+Clears all objects, events, deliveries, idempotency keys, and saved payment
+methods, then reapplies configuration seeding. Configured `[main_account]` keys
+and `webhook_endpoint.signing_secret` values survive; otherwise the main account
+gets fresh keys. Call `/internal/main` again after a reset to read them.

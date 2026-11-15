@@ -1,0 +1,655 @@
+mod common;
+
+use common::*;
+use serde_json::{Value, json};
+
+async fn create_customer(server: &TestServer, key: &str, email: &str) -> String {
+    let customer: Value = server
+        .client
+        .post(server.url("/v1/customers"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[("email", email), ("name", "Buyer")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    customer["id"].as_str().unwrap().to_string()
+}
+
+async fn create_product(server: &TestServer, key: &str, name: &str) -> String {
+    let product: Value = server
+        .client
+        .post(server.url("/v1/products"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[("name", name)])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    product["id"].as_str().unwrap().to_string()
+}
+
+async fn create_meter(server: &TestServer, key: &str) -> String {
+    let meter: Value = server
+        .client
+        .post(server.url("/v1/billing/meters"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("display_name", "API calls"),
+            ("event_name", "api_call"),
+            ("default_aggregation[formula]", "sum"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(meter["object"], "billing.meter");
+    assert_eq!(meter["status"], "active");
+    assert_eq!(
+        meter["customer_mapping"]["event_payload_key"],
+        "stripe_customer_id"
+    );
+    meter["id"].as_str().unwrap().to_string()
+}
+
+async fn report_usage(
+    server: &TestServer,
+    key: &str,
+    customer: &str,
+    identifier: &str,
+    value: i64,
+) -> reqwest::Response {
+    server
+        .client
+        .post(server.url("/v1/billing/meter_events"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("event_name", "api_call"),
+            ("identifier", identifier),
+            ("payload[stripe_customer_id]", customer),
+            ("payload[value]", &value.to_string()),
+        ])
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn meters_reject_duplicate_identifiers_and_aggregate_summaries() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let meter = create_meter(&server, &key).await;
+    let customer = create_customer(&server, &key, "usage@example.com").await;
+
+    let first = report_usage(&server, &key, &customer, "usage-1", 10).await;
+    assert!(first.status().is_success());
+    let event: Value = first.json().await.unwrap();
+    assert_eq!(event["object"], "billing.meter_event");
+    assert_eq!(event["identifier"], "usage-1");
+    assert_eq!(event["payload"]["value"], "10");
+    assert_eq!(event["payload"]["stripe_customer_id"], customer);
+
+    let second = report_usage(&server, &key, &customer, "usage-2", 5).await;
+    assert!(second.status().is_success());
+
+    let duplicate = report_usage(&server, &key, &customer, "usage-1", 10).await;
+    assert_eq!(duplicate.status(), 400);
+    let body: Value = duplicate.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "duplicate_meter_event");
+
+    let now = stripe_mock::time::now_epoch();
+    let start = (now / 3600) * 3600 - 3600;
+    let end = start + 7200;
+    let summaries: Value = server
+        .client
+        .get(server.url(&format!(
+            "/v1/billing/meters/{meter}/event_summaries?customer={customer}&start_time={start}&end_time={end}&value_grouping_window=hour"
+        )))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(summaries["object"], "list");
+    let data = summaries["data"].as_array().unwrap();
+    let total: i64 = data
+        .iter()
+        .map(|summary| summary["aggregated_value"].as_i64().unwrap())
+        .sum();
+    assert_eq!(total, 15);
+    assert_eq!(data[0]["object"], "billing.meter_event_summary");
+    assert_eq!(data[0]["meter"], meter);
+    assert!(data[0]["id"].as_str().unwrap().starts_with("mtrusg_"));
+}
+
+async fn create_metered_price(server: &TestServer, key: &str, meter: &str) -> String {
+    let product = create_product(server, key, "API Plan").await;
+    let price: Value = server
+        .client
+        .post(server.url("/v1/prices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("product", product.as_str()),
+            ("currency", "usd"),
+            ("recurring[interval]", "month"),
+            ("recurring[usage_type]", "metered"),
+            ("recurring[meter]", meter),
+            ("unit_amount", "2"),
+            ("nickname", "API calls"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(price["billing_scheme"], "per_unit");
+    assert_eq!(price["recurring"]["usage_type"], "metered");
+    assert_eq!(price["recurring"]["meter"], meter);
+    price["id"].as_str().unwrap().to_string()
+}
+
+async fn create_tiered_price(server: &TestServer, key: &str) -> String {
+    let product = create_product(server, key, "Seat Plan").await;
+    let price: Value = server
+        .client
+        .post(server.url("/v1/prices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("product", product.as_str()),
+            ("currency", "usd"),
+            ("recurring[interval]", "month"),
+            ("billing_scheme", "tiered"),
+            ("tiers_mode", "graduated"),
+            ("tiers[0][up_to]", "10"),
+            ("tiers[0][unit_amount]", "100"),
+            ("tiers[1][up_to]", "inf"),
+            ("tiers[1][unit_amount]", "50"),
+            ("nickname", "Seats"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(price["billing_scheme"], "tiered");
+    assert_eq!(price["tiers_mode"], "graduated");
+    assert_eq!(price["tiers"].as_array().unwrap().len(), 2);
+    assert_eq!(price["tiers"][1]["up_to"], Value::Null);
+    price["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn metered_and_tiered_prices_reject_quantities_and_price_invoices() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let meter = create_meter(&server, &key).await;
+    let customer = create_customer(&server, &key, "plans@example.com").await;
+    let metered = create_metered_price(&server, &key, &meter).await;
+    let tiered = create_tiered_price(&server, &key).await;
+
+    // A quantity on a metered line is rejected everywhere a line can name one.
+    let response = server
+        .client
+        .post(server.url("/v1/subscriptions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("items[0][price]", metered.as_str()),
+            ("items[0][quantity]", "2"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["param"], "items[0][quantity]");
+
+    let checkout = server
+        .client
+        .post(server.url("/v1/checkout/sessions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("mode", "subscription"),
+            ("line_items[0][price]", metered.as_str()),
+            ("line_items[0][quantity]", "2"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(checkout.status(), 400);
+
+    // A metered subscription starts with a paid first invoice and no quantity.
+    let subscription: Value = server
+        .client
+        .post(server.url("/v1/subscriptions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("items[0][price]", metered.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(subscription["items"]["data"][0]["quantity"], Value::Null);
+    let subscription_id = subscription["id"].as_str().unwrap().to_string();
+    let invoices: Value = server
+        .client
+        .get(server.url(&format!("/v1/invoices?subscription={subscription_id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(invoices["data"][0]["status"], "paid");
+    assert_eq!(invoices["data"][0]["billing_reason"], "subscription_create");
+
+    // Usage reported during the period is billed on the renewal invoice.
+    let usage = report_usage(&server, &key, &customer, "cycle-1", 7).await;
+    assert!(usage.status().is_success());
+    let renewal: Value = server
+        .client
+        .post(server.url(&format!(
+            "/internal/subscriptions/{subscription_id}/advance"
+        )))
+        .json(&json!({ "outcome": "paid" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(renewal["subscription"]["status"], "active");
+    assert_eq!(renewal["invoice"]["status"], "paid");
+    assert_eq!(renewal["invoice"]["billing_reason"], "subscription_cycle");
+    assert_eq!(renewal["invoice"]["total"], 14);
+    assert_eq!(renewal["invoice"]["lines"]["data"][0]["quantity"], 7);
+
+    // Graduated tiers: 10 units at 100 plus 15 at 50.
+    let tiered_subscription: Value = server
+        .client
+        .post(server.url("/v1/subscriptions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("items[0][price]", tiered.as_str()),
+            ("items[0][quantity]", "25"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tiered_id = tiered_subscription["id"].as_str().unwrap();
+    let tiered_invoices: Value = server
+        .client
+        .get(server.url(&format!("/v1/invoices?subscription={tiered_id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tiered_invoices["data"][0]["total"], 1750);
+}
+
+#[tokio::test]
+async fn embedded_checkout_returns_a_client_secret_and_saves_a_card() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "embedded@example.com").await;
+    let tiered = create_tiered_price(&server, &key).await;
+
+    let session: Value = server
+        .client
+        .post(server.url("/v1/checkout/sessions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("mode", "subscription"),
+            ("ui_mode", "embedded_page"),
+            (
+                "return_url",
+                "https://example.com/return?session={CHECKOUT_SESSION_ID}",
+            ),
+            ("customer", customer.as_str()),
+            ("line_items[0][price]", tiered.as_str()),
+            ("line_items[0][quantity]", "3"),
+            ("subscription_data[metadata][plan]", "team"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["ui_mode"], "embedded_page");
+    assert_eq!(session["url"], Value::Null);
+    let client_secret = session["client_secret"].as_str().unwrap();
+    assert!(client_secret.starts_with(session["id"].as_str().unwrap()));
+    let session_id = session["id"].as_str().unwrap().to_string();
+
+    let completion = server
+        .client
+        .post(server.url(&format!("/mock/checkout/{session_id}")))
+        .form(&[("card", "success")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(completion.status(), 303);
+    let location = completion
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(
+        location,
+        format!("https://example.com/return?session={session_id}")
+    );
+
+    let completed: Value = server
+        .client
+        .get(server.url(&format!("/v1/checkout/sessions/{session_id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed["status"], "complete");
+    let subscription_id = completed["subscription"].as_str().unwrap();
+    let subscription: Value = server
+        .client
+        .get(server.url(&format!("/v1/subscriptions/{subscription_id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(subscription["metadata"]["plan"], "team");
+
+    let stored_customer: Value = server
+        .client
+        .get(server.url(&format!(
+            "/v1/customers/{customer}?expand[]=invoice_settings.default_payment_method"
+        )))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let card = &stored_customer["invoice_settings"]["default_payment_method"]["card"];
+    assert_eq!(card["brand"], "visa");
+    assert_eq!(card["last4"], "4242");
+
+    let preview: Value = server
+        .client
+        .post(server.url("/v1/invoices/create_preview"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("subscription", subscription_id),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(preview["object"], "invoice");
+    assert_eq!(preview["billing_reason"], "upcoming");
+    assert_eq!(preview["status"], "draft");
+    assert!(preview["id"].as_str().unwrap().starts_with("upcoming_in_"));
+    assert!(preview["total"].as_i64().unwrap() > 0);
+
+    // The older GET form accepts the same fields as query parameters.
+    let upcoming: Value = server
+        .client
+        .get(server.url(&format!(
+            "/v1/invoices/upcoming?customer={customer}&subscription={subscription_id}"
+        )))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(upcoming["billing_reason"], "upcoming");
+}
+
+#[tokio::test]
+async fn failed_renewal_can_be_recovered_without_raising_another_invoice() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "renew@example.com").await;
+    let product = create_product(&server, &key, "Monthly").await;
+    let price: Value = server
+        .client
+        .post(server.url("/v1/prices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("product", product.as_str()),
+            ("currency", "usd"),
+            ("recurring[interval]", "month"),
+            ("unit_amount", "1000"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let price_id = price["id"].as_str().unwrap().to_string();
+    let subscription: Value = server
+        .client
+        .post(server.url("/v1/subscriptions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("items[0][price]", price_id.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = subscription["id"].as_str().unwrap().to_string();
+
+    let failed: Value = server
+        .client
+        .post(server.url(&format!("/internal/subscriptions/{id}/advance")))
+        .json(&json!({ "outcome": "failed" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failed["subscription"]["status"], "past_due");
+    assert_eq!(failed["invoice"]["status"], "open");
+    assert_eq!(failed["invoice"]["amount_remaining"], 1000);
+    assert_eq!(failed["invoice"]["attempt_count"], 1);
+    let invoice_id = failed["invoice"]["id"].as_str().unwrap().to_string();
+
+    let recovered: Value = server
+        .client
+        .post(server.url(&format!("/internal/subscriptions/{id}/advance")))
+        .json(&json!({ "outcome": "paid" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(recovered["subscription"]["status"], "active");
+    assert_eq!(recovered["invoice"]["id"], invoice_id);
+    assert_eq!(recovered["invoice"]["status"], "paid");
+    assert_eq!(recovered["invoice"]["attempt_count"], 2);
+
+    let invoices: Value = server
+        .client
+        .get(server.url(&format!("/v1/invoices?subscription={id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(invoices["data"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn configured_keys_and_signing_secrets_survive_reset() {
+    let server =
+        spawn_with_main_keys("sk_test_stateleo", "pk_test_stateleo", "whsec_stateleo").await;
+    let before: Value = server
+        .client
+        .get(server.url("/internal/main"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before["secret_key"], "sk_test_stateleo");
+    assert_eq!(before["publishable_key"], "pk_test_stateleo");
+    let destinations: Value = server
+        .client
+        .get(server.url("/internal/destinations"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        destinations["data"][0]["webhook_endpoint"]["signing_secret"],
+        "whsec_stateleo"
+    );
+
+    let reset = server
+        .client
+        .post(server.url("/internal/reset"))
+        .send()
+        .await
+        .unwrap();
+    assert!(reset.status().is_success());
+
+    let after: Value = server
+        .client
+        .get(server.url("/internal/main"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["secret_key"], "sk_test_stateleo");
+    assert_eq!(after["publishable_key"], "pk_test_stateleo");
+    let destinations: Value = server
+        .client
+        .get(server.url("/internal/destinations"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        destinations["data"][0]["webhook_endpoint"]["signing_secret"],
+        "whsec_stateleo"
+    );
+
+    // The configured key authenticates after the reset.
+    let customer = create_customer(&server, "sk_test_stateleo", "reset@example.com").await;
+    assert!(customer.starts_with("cus_"));
+}
+
+#[tokio::test]
+async fn idempotency_keys_replay_and_reject_different_parameters() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+
+    let first = server
+        .client
+        .post(server.url("/v1/customers"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Idempotency-Key", "customer-1")
+        .form(&[("email", "idem@example.com")])
+        .send()
+        .await
+        .unwrap();
+    assert!(first.status().is_success());
+    let body: Value = first.json().await.unwrap();
+    let customer_id = body["id"].as_str().unwrap().to_string();
+
+    let replay = server
+        .client
+        .post(server.url("/v1/customers"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Idempotency-Key", "customer-1")
+        .form(&[("email", "idem@example.com")])
+        .send()
+        .await
+        .unwrap();
+    assert!(replay.status().is_success());
+    assert_eq!(
+        replay
+            .headers()
+            .get("idempotent-replay")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    let replayed: Value = replay.json().await.unwrap();
+    assert_eq!(replayed["id"], customer_id);
+
+    let conflict = server
+        .client
+        .post(server.url("/v1/customers"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Idempotency-Key", "customer-1")
+        .form(&[("email", "other@example.com")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), 400);
+    let error: Value = conflict.json().await.unwrap();
+    assert_eq!(error["error"]["type"], "idempotency_error");
+
+    let customers: Value = server
+        .client
+        .get(server.url("/v1/customers"))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(customers["data"].as_array().unwrap().len(), 1);
+}
