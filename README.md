@@ -357,15 +357,15 @@ Hub may create it on first push when the token has permission).
 
 ## Documentation
 
-- [`docs/api-foundations.md`](docs/api-foundations.md) — auth, versions, envelopes, ids, timestamps, form parsing, response expansion.
+- [`docs/api-foundations.md`](docs/api-foundations.md) — auth, versions, envelopes, ids, timestamps, form parsing, response expansion, and idempotency keys.
 - [`docs/accounts.md`](docs/accounts.md) — v2 accounts, `include`/default-null, v1 projection, account links, onboarding.
 - [`docs/catalog.md`](docs/catalog.md) — products, prices, lookup keys, metered/tiered prices, and product expansion.
 - [`docs/meters.md`](docs/meters.md) — billing meters, meter events, event summaries, and usage pricing.
-- [`docs/billing.md`](docs/billing.md) — customers, subscriptions, updates, prorations, renewals, and billing portal sessions.
+- [`docs/billing.md`](docs/billing.md) — customers, subscriptions, updates, prorations, first/renewal invoices, billing-period advance, and billing portal sessions.
 - [`docs/coupons.md`](docs/coupons.md) — coupons, their validation rules, and redemption.
 - [`docs/tax-rates.md`](docs/tax-rates.md) — tax rates and their filters.
-- [`docs/invoicing.md`](docs/invoicing.md) — invoices, invoice lifecycle, and payment intents.
-- [`docs/checkout.md`](docs/checkout.md) — checkout sessions, customer email, discounts, tax, and totals.
+- [`docs/invoicing.md`](docs/invoicing.md) — invoices, invoice lifecycle, upcoming invoice preview, and payment intents.
+- [`docs/checkout.md`](docs/checkout.md) — checkout sessions, embedded checkout, saved cards, customer email, discounts, tax, and totals.
 - [`docs/hosted-ui.md`](docs/hosted-ui.md) — mock onboarding/checkout/invoice/billing-portal pages and headless driving.
 - [`docs/webhooks.md`](docs/webhooks.md) — events, destinations, signing, ordering, retries.
 - [`docs/internal.md`](docs/internal.md) — `/internal/**` control plane.

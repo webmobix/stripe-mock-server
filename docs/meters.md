@@ -133,10 +133,11 @@ curl -s -X POST $BASE/v1/prices \
   --data-urlencode 'unit_amount=2'
 ```
 
-Creating a subscription item or checkout line for a metered price with a
-`quantity` is rejected with an `invalid_request_error`; omit the quantity. The
-subscription item reports `quantity: null`. Usage is aggregated over the period
-that ends when the subscription advances (see
-[`billing.md`](billing.md#end-a-billing-period)) and is billed on that renewal
-invoice. `invoices.createPreview` reports usage accrued in the current period
-(see [`invoicing.md`](invoicing.md#preview-the-upcoming-invoice)).
+Creating or updating a subscription item, or creating a checkout line or
+invoice preview override, for a metered price with a `quantity` is rejected with
+an `invalid_request_error`; omit the quantity. The subscription item reports
+`quantity: null`. Usage is aggregated over the period that ends when the
+subscription advances (see [`billing.md`](billing.md#end-a-billing-period)) and
+is billed on that renewal invoice. `invoices.createPreview` reports usage
+accrued in the current period (see
+[`invoicing.md`](invoicing.md#preview-the-upcoming-invoice)).

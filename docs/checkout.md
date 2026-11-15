@@ -20,7 +20,9 @@ SID=$(echo "$SESSION" | python3 -c 'import sys,json;print(json.load(sys.stdin)["
 
 The response is a `cs_test_` session with `status=open`, `amount_total`,
 `line_items`, and a `url` pointing at the mock checkout page. Optional
-`customer` or `customer_account` fields are recorded.
+`customer` or `customer_account` fields are recorded. A line item naming a
+metered price must omit `quantity`; supplying one is rejected with an
+`invalid_request_error`.
 
 ## Embedded checkout
 
@@ -161,7 +163,7 @@ single transaction that:
 - for `subscription` mode creates an active `sub_` subscription and its paid
   first invoice (`billing_reason=subscription_create`),
 - for `setup` mode creates neither,
-- saves a simulated Visa `pm_` card on the customer and sets it as
+- saves a simulated Visa `pm_` card ending `4242` on the customer and sets it as
   `invoice_settings.default_payment_method`,
 - creates the associated events: `payment_intent.succeeded` (payment mode),
   `customer.subscription.created` + `invoice.paid` (subscription mode), and
@@ -170,7 +172,9 @@ single transaction that:
 Because state and events commit before the response returns, you can retrieve
 the session and list events immediately afterwards. The saved card is readable
 through `GET /v1/customers/{id}?expand[]=invoice_settings.default_payment_method`,
-`GET /v1/customers/{id}/payment_methods`, or `GET /v1/payment_methods/{id}`.
+`GET /v1/customers/{id}/payment_methods`,
+`GET /v1/customers/{id}/payment_methods/{payment_method}`, or
+`GET /v1/payment_methods/{id}`.
 
 On success the browser is redirected to `success_url` with
 `{CHECKOUT_SESSION_ID}` substituted; a declined simulation leaves the session

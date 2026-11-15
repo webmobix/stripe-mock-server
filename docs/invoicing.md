@@ -323,8 +323,8 @@ A new payment intent has a `pi_` id and a `status` of
 
 ### Resolving a payment intent
 
-The mock has no payment methods, so a test settles a payment intent through
-the control plane:
+The mock does not charge a saved payment method for a payment intent, so a
+test settles it through the control plane:
 
 ```bash
 curl -s -X POST $BASE/internal/payment_intents/$PIID/resolve \
@@ -387,10 +387,10 @@ invoice is finalized.
 
 ## Not supported
 
-- No `/v1/tax_rates` resource — tax rates are given inline on a line.
 - No `/v1/invoiceitems`; the lines live on the invoice itself and can be
   added, removed, and updated while it is a draft.
-- No `past_due` status and no automatic transitions — the mock has no
-  server-side time advance.
+- No scheduler or automatic billing-period transitions — periods advance only
+  through `POST /internal/subscriptions/{id}/advance` (see
+  [`billing.md`](billing.md#end-a-billing-period)).
 - No refunds, credit notes, or dunning.
 - `number` is always `null`.

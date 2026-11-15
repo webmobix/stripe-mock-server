@@ -60,9 +60,9 @@ curl -s -X POST $BASE/v1/prices \
 ```
 
 `unit_amount` is the price per unit of aggregated usage. A quantity on a metered
-subscription item or checkout line is rejected; the item's `quantity` is `null`.
-The mock bills the usage aggregated over the period when the subscription
-advances.
+subscription item (including on update), checkout line, or invoice preview
+override is rejected; the item's `quantity` is `null`. The mock bills the usage
+aggregated over the period when the subscription advances.
 
 ## Tiered prices
 

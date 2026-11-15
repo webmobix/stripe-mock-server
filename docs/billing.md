@@ -16,6 +16,11 @@ CID=$(echo "$CUSTOMER" | python3 -c 'import sys,json;print(json.load(sys.stdin)[
 curl -s "$BASE/v1/customers/$CID" -H "Authorization: Bearer $KEY"
 ```
 
+A completed checkout saves a simulated Visa card ending `4242` and sets it as
+the customer's `invoice_settings.default_payment_method`; read it directly or
+with `expand[]=invoice_settings.default_payment_method`. See
+[`checkout.md`](checkout.md#completion).
+
 ### Tax identification
 
 A customer may carry tax ids. Supply them as `tax_id_data[][type]` and

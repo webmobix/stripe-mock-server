@@ -118,7 +118,8 @@ Accepted parameter shapes:
 | comma-separated | `expand=product,price.product` |
 
 Supported reference fields: `product`, `price`, `customer`, `subscription`,
-and `payment_intent`. A field that already holds an object is left as-is.
+`payment_intent`, `payment_method`, and `default_payment_method`. A field that
+already holds an object is left as-is.
 Unknown paths, unresolvable ids, and references owned by another account leave
 the original value untouched and raise no error.
 
@@ -158,6 +159,9 @@ list form `expand[]=product` remains accepted for compatibility.
 | `coupon_` | coupon |
 | `bps_` | billing portal session |
 | `pi_` | payment intent |
+| `pm_` | payment method |
+| `mtr_` | billing meter |
+| `mtrusg_` | meter event summary |
 | `evt_` | event |
 | `sk_test_` | secret API key |
 | `pk_test_` | publishable API key |
