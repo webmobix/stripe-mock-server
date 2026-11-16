@@ -606,6 +606,7 @@ pub async fn create_price(
     let value = expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         price.to_json(),
         &collect_form_list(&params, "expand"),
     )
@@ -631,6 +632,7 @@ pub async fn get_price(
     let value = expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         price.to_json(),
         &collect_list_param(query.as_deref().unwrap_or(""), "expand"),
     )
@@ -698,7 +700,14 @@ pub async fn list_prices(
     let expands = collect_list_param(query.as_deref().unwrap_or(""), "expand");
     let data = page.iter().map(PriceRow::to_json).collect();
     let envelope = list_envelope("/v1/prices", data, has_more);
-    let value = expand_list_response(&st.pool, &ctx.account_id, envelope, &expands).await;
+    let value = expand_list_response(
+        &st.pool,
+        &ctx.account_id,
+        &st.config.base_url(),
+        envelope,
+        &expands,
+    )
+    .await;
     Ok(ok(value))
 }
 
@@ -832,6 +841,7 @@ pub async fn get_customer(
     let value = expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         customer.to_json(),
         &collect_list_param(query.as_deref().unwrap_or(""), "expand"),
     )
@@ -871,7 +881,14 @@ pub async fn list_customers(
     let data = page.iter().map(|c| c.to_json()).collect();
     let envelope = list_envelope("/v1/customers", data, has_more);
     let expands = collect_list_param(query.as_deref().unwrap_or(""), "expand");
-    let value = expand_list_response(&st.pool, &ctx.account_id, envelope, &expands).await;
+    let value = expand_list_response(
+        &st.pool,
+        &ctx.account_id,
+        &st.config.base_url(),
+        envelope,
+        &expands,
+    )
+    .await;
     Ok(ok(value))
 }
 
@@ -1097,6 +1114,25 @@ pub async fn create_subscription(
     if items.is_empty() {
         return Err(ApiError::missing_param(v1(), "items"));
     }
+    // The anchor day is echoed only; the mock does not align periods to it.
+    let anchor_config = match get_str(&params, &["billing_cycle_anchor_config", "day_of_month"]) {
+        None => None,
+        Some(raw) => {
+            let day = raw
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .filter(|day| (1..=31).contains(day))
+                .ok_or_else(|| {
+                    ApiError::invalid_param(
+                        v1(),
+                        "billing_cycle_anchor_config[day_of_month]",
+                        "Invalid day_of_month: must be an integer between 1 and 31",
+                    )
+                })?;
+            Some(json!({ "day_of_month": day }))
+        }
+    };
     let id = ids::subscription_id();
     // A subscription for a clock customer inherits the clock and runs on its
     // frozen time; every other subscription keeps wall-clock time.
@@ -1168,8 +1204,8 @@ pub async fn create_subscription(
         let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
         sqlx::query(
             "INSERT INTO subscriptions (id, account_id, customer, customer_account, status, created, current_period_start,
-                current_period_end, cancel_at_period_end, items, metadata, test_clock)
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, ?6, 0, ?7, ?8, ?9)",
+                current_period_end, cancel_at_period_end, items, metadata, test_clock, billing_cycle_anchor_config)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, ?6, 0, ?7, ?8, ?9, ?10)",
         )
         .bind(&id)
         .bind(&ctx.account_id)
@@ -1180,6 +1216,7 @@ pub async fn create_subscription(
         .bind(serde_json::to_string(&built_items).unwrap())
         .bind(metadata_from(&params).to_string())
         .bind(&test_clock)
+        .bind(anchor_config.as_ref().map(Value::to_string))
         .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
@@ -1190,18 +1227,8 @@ pub async fn create_subscription(
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(ApiError::internal)?;
-        let mut event_ids = vec![
-            events::emit_at(
-                &mut tx,
-                &ctx.account_id,
-                ctx.is_connected,
-                "customer.subscription.created",
-                subscription.to_json(),
-                now,
-            )
-            .await
-            .map_err(ApiError::internal)?,
-        ];
+        // Raise the first invoice first: it stamps `latest_invoice`, so the
+        // reloaded row and the `customer.subscription.created` event carry it.
         let (_, invoice_events) = crate::api::billing::raise_subscription_invoice(
             &mut tx,
             &subscription,
@@ -1217,7 +1244,25 @@ pub async fn create_subscription(
             &st.config.base_url(),
         )
         .await?;
-        event_ids.extend(invoice_events);
+        let subscription: SubscriptionRow =
+            sqlx::query_as("SELECT * FROM subscriptions WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(ApiError::internal)?;
+        let mut event_ids = invoice_events;
+        event_ids.push(
+            events::emit_at(
+                &mut tx,
+                &ctx.account_id,
+                ctx.is_connected,
+                "customer.subscription.created",
+                subscription.to_json(),
+                now,
+            )
+            .await
+            .map_err(ApiError::internal)?,
+        );
         tx.commit().await.map_err(ApiError::internal)?;
         event_ids
     };
@@ -1234,6 +1279,7 @@ pub async fn create_subscription(
     let value = expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         subscription.to_json(),
         &collect_form_list(&params, "expand"),
     )
@@ -1260,6 +1306,7 @@ pub async fn get_subscription(
     let value = expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         subscription.to_json(),
         &collect_list_param(query.as_deref().unwrap_or(""), "expand"),
     )
@@ -1304,7 +1351,14 @@ pub async fn list_subscriptions(
     let expands = collect_list_param(query.as_deref().unwrap_or(""), "expand");
     let data = page.iter().map(SubscriptionRow::to_json).collect();
     let envelope = list_envelope("/v1/subscriptions", data, has_more);
-    let value = expand_list_response(&st.pool, &ctx.account_id, envelope, &expands).await;
+    let value = expand_list_response(
+        &st.pool,
+        &ctx.account_id,
+        &st.config.base_url(),
+        envelope,
+        &expands,
+    )
+    .await;
     Ok(ok(value))
 }
 
@@ -1330,13 +1384,33 @@ pub async fn cancel_subscription(
         ));
     }
 
-    let event_id = {
-        let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
-        sqlx::query("UPDATE subscriptions SET status = 'canceled' WHERE id = ?1")
-            .bind(&id)
-            .execute(&mut *tx)
+    // A clock subscription is stamped with simulated time, like its invoices
+    // and every other clock-scoped operation.
+    let cancelled_at = match &subscription.test_clock {
+        Some(clock_id) => {
+            let frozen: Option<i64> = sqlx::query_scalar(
+                "SELECT frozen_time FROM test_clocks WHERE id = ?1 AND account_id = ?2",
+            )
+            .bind(clock_id)
+            .bind(&ctx.account_id)
+            .fetch_optional(&st.pool)
             .await
             .map_err(ApiError::internal)?;
+            frozen.unwrap_or_else(time::now_epoch)
+        }
+        None => time::now_epoch(),
+    };
+
+    let event_id = {
+        let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+        sqlx::query(
+            "UPDATE subscriptions SET status = 'canceled', canceled_at = ?1, ended_at = ?1 WHERE id = ?2",
+        )
+        .bind(cancelled_at)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
         let updated: SubscriptionRow = sqlx::query_as("SELECT * FROM subscriptions WHERE id = ?1")
             .bind(&id)
             .fetch_one(&mut *tx)
@@ -1547,6 +1621,13 @@ pub async fn update_subscription(
     let cancel_at_period_end = get_bool(&params, &["cancel_at_period_end"])
         .map(i64::from)
         .unwrap_or(subscription.cancel_at_period_end);
+    // `cancel_at` mirrors the current period end while cancellation is
+    // scheduled and clears when it is turned off.
+    let cancel_at = if cancel_at_period_end != 0 {
+        subscription.current_period_end
+    } else {
+        None
+    };
     let metadata = if params.get("metadata").is_some() {
         metadata_from(&params).to_string()
     } else {
@@ -1559,10 +1640,11 @@ pub async fn update_subscription(
     let event_id = {
         let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
         sqlx::query(
-            "UPDATE subscriptions SET items = ?1, cancel_at_period_end = ?2, metadata = ?3 WHERE id = ?4",
+            "UPDATE subscriptions SET items = ?1, cancel_at_period_end = ?2, cancel_at = ?3, metadata = ?4 WHERE id = ?5",
         )
         .bind(serde_json::to_string(&stored_items).unwrap_or_else(|_| "[]".to_string()))
         .bind(cancel_at_period_end)
+        .bind(cancel_at)
         .bind(&metadata)
         .bind(&id)
         .execute(&mut *tx)
@@ -1596,6 +1678,7 @@ pub async fn update_subscription(
     let mut value = expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         updated.to_json(),
         &collect_form_list(&params, "expand"),
     )
@@ -1756,6 +1839,26 @@ pub async fn create_checkout_session(
     } else {
         json!({})
     };
+    // Both parameters are echoed only: neither changes the simulated pricing.
+    let payment_method_collection = match get_str(&params, &["payment_method_collection"])
+        .as_deref()
+    {
+        None => "always".to_string(),
+        Some("always") => "always".to_string(),
+        Some("if_required") => "if_required".to_string(),
+        Some(other) => {
+            return Err(ApiError::invalid_param(
+                v1(),
+                "payment_method_collection",
+                format!(
+                    "Invalid payment_method_collection: {other}. Expected always or if_required."
+                ),
+            ));
+        }
+    };
+    let automatic_tax = json!({
+        "enabled": get_bool(&params, &["automatic_tax", "enabled"]).unwrap_or(false),
+    });
     let now = time::now_epoch();
     let raw_items = get_array(&params, &["line_items"])
         .cloned()
@@ -1996,9 +2099,9 @@ pub async fn create_checkout_session(
             "INSERT INTO checkout_sessions (id, account_id, mode, status, created, expires_at, success_url, cancel_url,
                 customer, customer_account, customer_email, line_items, payment_intent, subscription, amount_subtotal,
                 amount_total, amount_discount, amount_tax, discounts, currency, url, metadata,
-                ui_mode, return_url, client_secret, subscription_metadata)
+                ui_mode, return_url, client_secret, subscription_metadata, payment_method_collection, automatic_tax)
              VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                ?20, ?21, ?22, ?23)",
+                ?20, ?21, ?22, ?23, ?24, ?25)",
         )
         .bind(&id)
         .bind(&ctx.account_id)
@@ -2023,6 +2126,8 @@ pub async fn create_checkout_session(
         .bind(&return_url)
         .bind(&client_secret)
         .bind(subscription_metadata.to_string())
+        .bind(&payment_method_collection)
+        .bind(automatic_tax.to_string())
         .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
@@ -2043,6 +2148,7 @@ pub async fn create_checkout_session(
     let value = expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         session.to_json(),
         &collect_form_list(&params, "expand"),
     )
@@ -2061,6 +2167,7 @@ pub async fn get_checkout_session(
     let value = expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         session.to_json(),
         &collect_list_param(query.as_deref().unwrap_or(""), "expand"),
     )
@@ -2084,6 +2191,7 @@ pub async fn get_checkout_line_items(
     let value = expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         value,
         &collect_list_param(query.as_deref().unwrap_or(""), "expand"),
     )
@@ -2269,6 +2377,17 @@ pub async fn complete_checkout_session(
             );
         }
 
+        // A completed checkout saves the simulated card on the customer before
+        // the subscription row exists, so the created event carries it.
+        let default_payment_method = match &session.customer {
+            Some(customer) => Some(
+                crate::api::payment_methods::attach_default_card(&mut tx, &account_id, customer)
+                    .await
+                    .map_err(ApiError::internal)?,
+            ),
+            None => None,
+        };
+
         if let Some(sub_id) = &subscription_id_value {
             // A clock customer's checkout subscription inherits the clock; the
             // session itself stays wall-clock time.
@@ -2342,8 +2461,8 @@ pub async fn complete_checkout_session(
                 .collect();
             sqlx::query(
                 "INSERT INTO subscriptions (id, account_id, customer, customer_account, status, created, current_period_start,
-                    current_period_end, cancel_at_period_end, items, metadata, test_clock)
-                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, ?6, 0, ?7, ?8, ?9)",
+                    current_period_end, cancel_at_period_end, items, metadata, test_clock, default_payment_method)
+                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, ?6, 0, ?7, ?8, ?9, ?10)",
             )
             .bind(sub_id)
             .bind(&account_id)
@@ -2354,9 +2473,34 @@ pub async fn complete_checkout_session(
             .bind(serde_json::to_string(&items).unwrap())
             .bind(session.subscription_metadata().to_string())
             .bind(&test_clock)
+            .bind(&default_payment_method)
             .execute(&mut *tx)
             .await
             .map_err(ApiError::internal)?;
+            let subscription: SubscriptionRow =
+                sqlx::query_as("SELECT * FROM subscriptions WHERE id = ?1")
+                    .bind(sub_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(ApiError::internal)?;
+            // The first invoice stamps `latest_invoice`, so emit the created
+            // event after it with the reloaded row.
+            let (_, invoice_events) = crate::api::billing::raise_subscription_invoice(
+                &mut tx,
+                &subscription,
+                &account_id,
+                is_connected,
+                now,
+                period_end,
+                now,
+                period_end,
+                "subscription_create",
+                true,
+                now,
+                &st.config.base_url(),
+            )
+            .await?;
+            event_ids.extend(invoice_events);
             let subscription: SubscriptionRow =
                 sqlx::query_as("SELECT * FROM subscriptions WHERE id = ?1")
                     .bind(sub_id)
@@ -2375,29 +2519,6 @@ pub async fn complete_checkout_session(
                 .await
                 .map_err(ApiError::internal)?,
             );
-            let (_, invoice_events) = crate::api::billing::raise_subscription_invoice(
-                &mut tx,
-                &subscription,
-                &account_id,
-                is_connected,
-                now,
-                period_end,
-                now,
-                period_end,
-                "subscription_create",
-                true,
-                now,
-                &st.config.base_url(),
-            )
-            .await?;
-            event_ids.extend(invoice_events);
-        }
-
-        // A completed checkout saves the simulated card on the customer.
-        if let Some(customer) = &session.customer {
-            crate::api::payment_methods::attach_default_card(&mut tx, &account_id, customer)
-                .await
-                .map_err(ApiError::internal)?;
         }
 
         sqlx::query(

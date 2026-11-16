@@ -182,6 +182,7 @@ pub async fn create_test_clock(
     let value = expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         clock.to_json(),
         &collect_form_list(&params, "expand"),
     )
@@ -200,6 +201,7 @@ pub async fn get_test_clock(
     let value = expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         clock.to_json(),
         &collect_list_param(query.as_deref().unwrap_or(""), "expand"),
     )
@@ -233,6 +235,7 @@ pub async fn list_test_clocks(
     let value = expand_list_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         envelope,
         &collect_list_param(query.as_deref().unwrap_or(""), "expand"),
     )
@@ -264,11 +267,14 @@ pub async fn delete_test_clock(
             if subscription.status == "canceled" {
                 continue;
             }
-            sqlx::query("UPDATE subscriptions SET status = 'canceled' WHERE id = ?1")
-                .bind(&subscription.id)
-                .execute(&mut *tx)
-                .await
-                .map_err(ApiError::internal)?;
+            sqlx::query(
+                "UPDATE subscriptions SET status = 'canceled', canceled_at = ?1, ended_at = ?1 WHERE id = ?2",
+            )
+            .bind(clock.frozen_time)
+            .bind(&subscription.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
             let canceled: SubscriptionRow =
                 sqlx::query_as("SELECT * FROM subscriptions WHERE id = ?1")
                     .bind(&subscription.id)
@@ -482,6 +488,7 @@ pub async fn advance_test_clock(
     let value = expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         clock.render("advancing", json!({ "target_frozen_time": target })),
         &collect_form_list(&params, "expand"),
     )

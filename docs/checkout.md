@@ -24,6 +24,29 @@ The response is a `cs_test_` session with `status=open`, `amount_total`,
 metered price must omit `quantity`; supplying one is rejected with an
 `invalid_request_error`.
 
+### Echoed parameters
+
+Two parameters are accepted, stored, and echoed; neither changes the simulated
+pricing:
+
+- `payment_method_collection` is `always` (the default) or `if_required`.
+  Any other value is rejected with an `invalid_request_error` naming the
+  parameter and no session is created.
+- `automatic_tax[enabled]` is a boolean, defaulting to false. The session
+  reports `automatic_tax` as `{enabled, status: null}`.
+
+```bash
+SESSION=$(curl -s -X POST $BASE/v1/checkout/sessions \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode "mode=subscription" \
+  --data-urlencode "customer=$CID" \
+  --data-urlencode "line_items[0][price]=$PRICE_ID" \
+  --data-urlencode "payment_method_collection=if_required" \
+  --data-urlencode "automatic_tax[enabled]=true")
+```
+
+Both values survive retrieval and completion.
+
 ## Embedded checkout
 
 Set `ui_mode=embedded_page` (the older `embedded` spelling is accepted too) and
@@ -165,6 +188,9 @@ single transaction that:
 - for `setup` mode creates neither,
 - saves a simulated Visa `pm_` card ending `4242` on the customer and sets it as
   `invoice_settings.default_payment_method`,
+- for `subscription` mode sets that card as the subscription's
+  `default_payment_method` before the subscription is created, so
+  `customer.subscription.created` and retrieval both carry it,
 - creates the associated events: `payment_intent.succeeded` (payment mode),
   `customer.subscription.created` + `invoice.paid` (subscription mode), and
   `checkout.session.completed`.

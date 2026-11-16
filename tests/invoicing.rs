@@ -312,10 +312,42 @@ async fn invoice_is_created_with_lines_and_totals() {
     assert_eq!(invoice["subtotal"], 4000);
     assert_eq!(invoice["total"], 4000);
     assert_eq!(invoice["tax_total"], 0);
+    assert_eq!(invoice["total_taxes"], json!([]));
     let lines = invoice["lines"]["data"].as_array().unwrap();
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0]["amount"], 4000);
     assert_eq!(lines[0]["quantity"], 2);
+    assert_eq!(lines[0]["parent"], Value::Null);
+    assert_eq!(lines[0]["pricing"]["type"], "price_details");
+    assert_eq!(lines[0]["pricing"]["price_details"]["price"], price);
+    assert_eq!(lines[0]["pricing"]["unit_amount_decimal"], "2000");
+}
+
+#[tokio::test]
+async fn an_ad_hoc_line_has_null_pricing() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "buyer@example.com").await;
+
+    let invoice: Value = server
+        .client
+        .post(server.url("/v1/invoices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("lines[0][amount]", "500"),
+            ("lines[0][description]", "Setup"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let line = &invoice["lines"]["data"][0];
+    assert_eq!(line["amount"], 500);
+    assert_eq!(line["pricing"], Value::Null);
+    assert_eq!(line["parent"], Value::Null);
 }
 
 #[tokio::test]
@@ -397,6 +429,17 @@ async fn invoice_line_carries_an_inline_tax_rate() {
 
     assert_eq!(invoice["tax_total"], 100);
     assert_eq!(invoice["total"], 1100);
+    assert_eq!(invoice["parent"], Value::Null);
+    let total_taxes = invoice["total_taxes"].as_array().unwrap();
+    assert_eq!(total_taxes.len(), 1);
+    assert_eq!(total_taxes[0]["amount"], 100);
+    assert_eq!(total_taxes[0]["taxable_amount"], 1000);
+    assert!(
+        total_taxes[0]["tax_rate"]
+            .as_str()
+            .unwrap()
+            .starts_with("txr_")
+    );
     let line = &invoice["lines"]["data"][0];
     assert_eq!(line["amount"], 1000);
     let tax_amounts = line["tax_amounts"].as_array().unwrap();

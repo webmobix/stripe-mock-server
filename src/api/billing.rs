@@ -189,6 +189,30 @@ pub async fn aggregate_meter_usage(
     })
 }
 
+/// The `pricing` object for a line priced from a catalog price.
+///
+/// `unit_amount_decimal` follows the price's unit amount. A tiered price has no
+/// single unit amount, so it reports null rather than a misleading line total.
+pub fn line_pricing(price: &Value) -> Value {
+    let price_id = price.get("id").and_then(Value::as_str);
+    let product_id = price.get("product").and_then(Value::as_str);
+    match (price_id, product_id) {
+        (Some(price_id), Some(product_id)) => {
+            let unit_amount_decimal = price
+                .get("unit_amount")
+                .and_then(Value::as_i64)
+                .map(|unit| json!(unit.to_string()))
+                .unwrap_or(Value::Null);
+            json!({
+                "type": "price_details",
+                "price_details": { "price": price_id, "product": product_id },
+                "unit_amount_decimal": unit_amount_decimal,
+            })
+        }
+        _ => Value::Null,
+    }
+}
+
 /// The line items a subscription raises for one period.
 ///
 /// Licensed items bill their quantity. Metered items bill the customer's
@@ -237,8 +261,17 @@ pub async fn subscription_invoice_lines(
             "currency": price.get("currency").cloned().unwrap_or(json!("usd")),
             "description": price.get("nickname").cloned().unwrap_or(Value::Null),
             "discountable": true,
+            "parent": {
+                "type": "subscription_item_details",
+                "subscription_item_details": {
+                    "invoice_item": Value::Null,
+                    "subscription": subscription.id,
+                    "subscription_item": item.get("id").cloned().unwrap_or(Value::Null),
+                },
+            },
             "period": { "start": line_start, "end": line_end },
             "price": price,
+            "pricing": line_pricing(&price),
             "proration": false,
             "quantity": if metered {
                 usage_number(quantity)
@@ -310,10 +343,10 @@ pub async fn raise_subscription_invoice(
             finalized_at, paid_at, voided_at, due_date, amount_due, amount_paid, amount_remaining,
             subtotal, tax_total, total, lines, customer_tax_ids, description, metadata,
             subscription, billing_reason, period_start, period_end, collection_method,
-            attempt_count, payment_intent, test_clock)
+            attempt_count, payment_intent, test_clock, subscription_metadata)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6, ?7, NULL, NULL, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, '[]', NULL, '{}', ?15, ?16, ?17, ?18,
-            'charge_automatically', 1, NULL, ?19)",
+            'charge_automatically', 1, NULL, ?19, ?20)",
     )
     .bind(&id)
     .bind(account_id)
@@ -334,9 +367,18 @@ pub async fn raise_subscription_invoice(
     .bind(period_start)
     .bind(period_end)
     .bind(&subscription.test_clock)
+    .bind(&subscription.metadata)
     .execute(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
+    // The subscription's latest invoice is stamped in the same transaction so
+    // API responses and `customer.subscription.*` events render the same id.
+    sqlx::query("UPDATE subscriptions SET latest_invoice = ?1 WHERE id = ?2")
+        .bind(&id)
+        .bind(&subscription.id)
+        .execute(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
 
     let invoice: InvoiceRow = sqlx::query_as("SELECT * FROM invoices WHERE id = ?1")
         .bind(&id)
@@ -532,6 +574,20 @@ pub async fn advance_subscription_periods(
     match run {
         AdvanceRun::OnePeriod => {
             let now = retry_at;
+            // A subscription scheduled to cancel ends at the period boundary
+            // instead of raising a renewal.
+            if current.cancel_at_period_end != 0 {
+                cancel_at_boundary(
+                    tx,
+                    &mut current,
+                    account_id,
+                    is_connected,
+                    retry_at,
+                    event_ids,
+                )
+                .await?;
+                return Ok(None);
+            }
             let old_start = current.current_period_start.unwrap_or(now);
             let old_end = current.current_period_end.unwrap_or(now);
             let period_start = current.current_period_end.unwrap_or(now);
@@ -566,6 +622,9 @@ pub async fn advance_subscription_periods(
             )
             .await?;
             event_ids.extend(invoice_events);
+            // The raise stamped `latest_invoice`; reload so the event payload
+            // matches the persisted subscription.
+            current = load_subscription(tx, &current.id).await?;
             event_ids.push(
                 events::emit_at(
                     tx,
@@ -590,24 +649,15 @@ pub async fn advance_subscription_periods(
                     break;
                 }
                 if current.cancel_at_period_end != 0 {
-                    sqlx::query("UPDATE subscriptions SET status = 'canceled' WHERE id = ?1")
-                        .bind(&current.id)
-                        .execute(&mut **tx)
-                        .await
-                        .map_err(ApiError::internal)?;
-                    current = load_subscription(tx, &current.id).await?;
-                    event_ids.push(
-                        events::emit_at(
-                            tx,
-                            account_id,
-                            is_connected,
-                            "customer.subscription.deleted",
-                            current.to_json(),
-                            boundary,
-                        )
-                        .await
-                        .map_err(ApiError::internal)?,
-                    );
+                    cancel_at_boundary(
+                        tx,
+                        &mut current,
+                        account_id,
+                        is_connected,
+                        boundary,
+                        event_ids,
+                    )
+                    .await?;
                     break;
                 }
                 let old_start = current.current_period_start.unwrap_or(boundary);
@@ -644,6 +694,9 @@ pub async fn advance_subscription_periods(
                 )
                 .await?;
                 event_ids.extend(invoice_events);
+                // The raise stamped `latest_invoice`; reload so the event
+                // payload matches the persisted subscription.
+                current = load_subscription(tx, &current.id).await?;
                 event_ids.push(
                     events::emit_at(
                         tx,
@@ -662,6 +715,41 @@ pub async fn advance_subscription_periods(
     }
 
     Ok(last_invoice)
+}
+
+/// Cancel a subscription at its period boundary, stamping `canceled_at` and
+/// `ended_at` and emitting `customer.subscription.deleted`.
+async fn cancel_at_boundary(
+    tx: &mut Transaction<'_, Sqlite>,
+    current: &mut SubscriptionRow,
+    account_id: &str,
+    is_connected: bool,
+    retry_at: i64,
+    event_ids: &mut Vec<String>,
+) -> Result<(), ApiError> {
+    let boundary = current.current_period_end.unwrap_or(retry_at);
+    sqlx::query(
+        "UPDATE subscriptions SET status = 'canceled', canceled_at = ?1, ended_at = ?1 WHERE id = ?2",
+    )
+    .bind(boundary)
+    .bind(&current.id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    *current = load_subscription(tx, &current.id).await?;
+    event_ids.push(
+        events::emit_at(
+            tx,
+            account_id,
+            is_connected,
+            "customer.subscription.deleted",
+            current.to_json(),
+            boundary,
+        )
+        .await
+        .map_err(ApiError::internal)?,
+    );
+    Ok(())
 }
 
 /// Reload a subscription inside the caller's transaction.

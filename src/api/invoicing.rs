@@ -487,11 +487,17 @@ fn render_line(draft: &LineDraft) -> Result<Value, ApiError> {
         "currency": draft.currency,
         "description": draft.description,
         "discountable": true,
+        "parent": Value::Null,
         "period": {
             "start": time::now_epoch(),
             "end": time::now_epoch() + 30 * 86_400,
         },
         "price": draft.price.clone().unwrap_or(Value::Null),
+        "pricing": draft
+            .price
+            .as_ref()
+            .map(|price| crate::api::billing::line_pricing(price))
+            .unwrap_or(Value::Null),
         "proration": false,
         "quantity": draft.quantity,
         "tax_amounts": Vec::<Value>::new(),
@@ -954,7 +960,7 @@ async fn preview_invoice(
     let overrides = get_array(params, &["subscription_details", "items"])
         .cloned()
         .unwrap_or_default();
-    let mut priced: Vec<(Value, i64)> = Vec::new();
+    let mut priced: Vec<(Value, i64, Option<String>)> = Vec::new();
     if !overrides.is_empty() {
         for (index, item) in overrides.iter().enumerate() {
             let price_id = get_str(item, &["price"]).ok_or_else(|| {
@@ -982,7 +988,7 @@ async fn preview_invoice(
             } else {
                 parse_quantity(item)?
             };
-            priced.push((price.to_json(), quantity));
+            priced.push((price.to_json(), quantity, None));
         }
     } else if let Some(subscription) = &subscription {
         for item in parse_json(&Some(subscription.items.clone()))
@@ -992,7 +998,8 @@ async fn preview_invoice(
         {
             let price = item.get("price").cloned().unwrap_or(Value::Null);
             let quantity = get_i64(&item, &["quantity"]).unwrap_or(0);
-            priced.push((price, quantity));
+            let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
+            priced.push((price, quantity, item_id));
         }
     }
 
@@ -1000,7 +1007,7 @@ async fn preview_invoice(
         Some(currency) => currency,
         None => priced
             .iter()
-            .find_map(|(price, _)| get_str(price, &["currency"]))
+            .find_map(|(price, _, _)| get_str(price, &["currency"]))
             .or_else(|| customer.currency.clone())
             .unwrap_or_else(|| "usd".to_string()),
     };
@@ -1028,7 +1035,7 @@ async fn preview_invoice(
 
     let mut lines = Vec::new();
     let mut subtotal = 0i64;
-    for (price, quantity) in priced {
+    for (price, quantity, item_id) in priced {
         let metered = crate::api::billing::price_is_metered(&price);
         let (line_start, line_end) = if metered {
             current_period
@@ -1056,6 +1063,17 @@ async fn preview_invoice(
         };
         let amount = crate::api::billing::amount_for_quantity(&price, used);
         subtotal += amount;
+        let parent = match &subscription {
+            Some(subscription) => json!({
+                "type": "subscription_item_details",
+                "subscription_item_details": {
+                    "invoice_item": Value::Null,
+                    "subscription": subscription.id,
+                    "subscription_item": item_id.clone(),
+                },
+            }),
+            None => Value::Null,
+        };
         lines.push(json!({
             "id": ids::id("il_"),
             "object": "line_item",
@@ -1063,17 +1081,35 @@ async fn preview_invoice(
             "currency": currency,
             "description": price.get("nickname").cloned().unwrap_or(Value::Null),
             "discountable": true,
+            "parent": parent,
             "period": { "start": line_start, "end": line_end },
             "price": price,
+            "pricing": crate::api::billing::line_pricing(&price),
             "proration": false,
             "quantity": if metered { crate::models::usage_number(used) } else { json!(quantity) },
             "subscription": subscription.as_ref().map(|sub| sub.id.clone()),
-            "subscription_item": Value::Null,
+            "subscription_item": item_id,
             "tax_amounts": [],
             "tax_rates": [],
         }));
     }
     let total = subtotal;
+    let parent = match &subscription {
+        Some(subscription) => {
+            let metadata = match crate::models::parse_json(&subscription.metadata) {
+                Value::Object(map) => Value::Object(map),
+                _ => json!({}),
+            };
+            json!({
+                "type": "subscription_details",
+                "subscription_details": {
+                    "metadata": metadata,
+                    "subscription": subscription.id,
+                },
+            })
+        }
+        None => Value::Null,
+    };
     let invoice = json!({
         "id": ids::invoice_preview_id(),
         "object": "invoice",
@@ -1103,6 +1139,7 @@ async fn preview_invoice(
         "number": null,
         "paid": false,
         "paid_at": null,
+        "parent": parent,
         "payment_intent": null,
         "period_end": period_end,
         "period_start": period_start,
@@ -1111,12 +1148,14 @@ async fn preview_invoice(
         "subtotal": subtotal,
         "tax_total": 0,
         "total": total,
+        "total_taxes": Vec::<Value>::new(),
         "updated": now,
         "voided_at": null,
     });
     Ok(crate::api::expand::expand_response(
         &st.pool,
         &ctx.account_id,
+        &st.config.base_url(),
         invoice,
         &crate::api::collect_form_list(params, "expand"),
     )

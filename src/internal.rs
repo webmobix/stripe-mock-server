@@ -1,21 +1,23 @@
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::response::Response;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
 use crate::AppState;
 use crate::api::billing::{AdvanceRun, advance_subscription_periods};
-use crate::api::ok;
+use crate::api::{get_str, ok};
 use crate::db;
 use crate::error::ApiError;
+use crate::form;
 use crate::models::{
-    AccountRow, DeliveryRow, EventDestinationRow, PaymentIntentRow, SubscriptionRow,
+    AccountRow, DeliveryRow, EventDestinationRow, MeterEventRow, PaymentIntentRow, SubscriptionRow,
 };
 use crate::seed;
 use crate::time;
+use crate::util::list_envelope;
 
 async fn account_with_keys(pool: &SqlitePool, account: &AccountRow) -> Value {
     let keys: Vec<(String, String)> =
@@ -276,6 +278,46 @@ pub async fn resolve_payment_intent(
     })))
 }
 
+/// `GET /internal/meter_events`: inspect accepted raw meter events without
+/// Stripe authentication. Optional `event_name` and `customer` filters narrow
+/// the v1 list envelope the endpoint returns.
+pub async fn list_meter_events(
+    State(st): State<AppState>,
+    RawQuery(query): RawQuery,
+) -> Result<Response, ApiError> {
+    let params = form::parse_form(query.as_deref().unwrap_or(""));
+    let event_name = get_str(&params, &["event_name"]);
+    let customer = get_str(&params, &["customer"]);
+    let events: Vec<MeterEventRow> =
+        sqlx::query_as("SELECT * FROM meter_events ORDER BY timestamp, rowid")
+            .fetch_all(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let data: Vec<Value> = events
+        .into_iter()
+        .filter(|event| {
+            event_name
+                .as_deref()
+                .is_none_or(|name| event.event_name == name)
+        })
+        .filter(|event| {
+            customer
+                .as_deref()
+                .is_none_or(|id| event.customer.as_deref() == Some(id))
+        })
+        .map(|event| {
+            json!({
+                "identifier": event.identifier,
+                "event_name": event.event_name,
+                "customer": event.customer,
+                "value": crate::models::usage_number(event.value).to_string(),
+                "timestamp": event.timestamp,
+            })
+        })
+        .collect();
+    Ok(ok(list_envelope("/internal/meter_events", data, false)))
+}
+
 /// `POST /internal/subscriptions/{id}/advance`: end the current billing period
 /// and collect the renewal invoice, or retry an open invoice after a failure.
 ///
@@ -283,6 +325,8 @@ pub async fn resolve_payment_intent(
 /// call retries it without moving the period, so a test can model failure and
 /// then recovery. Otherwise the period advances, a `subscription_cycle`
 /// invoice is raised, and the subscription becomes `active` or `past_due`.
+/// A subscription with `cancel_at_period_end=true` is canceled at the boundary
+/// instead, emits `customer.subscription.deleted`, and reports a null invoice.
 pub async fn advance_subscription(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -359,8 +403,7 @@ pub async fn advance_subscription(
             &st.config.base_url(),
             &mut event_ids,
         )
-        .await?
-        .ok_or_else(|| ApiError::internal("advance raised no invoice"))?;
+        .await?;
         tx.commit().await.map_err(ApiError::internal)?;
         invoice
     };
@@ -376,6 +419,6 @@ pub async fn advance_subscription(
     Ok(ok(json!({
         "outcome": outcome,
         "subscription": subscription.to_json(),
-        "invoice": invoice.to_json(&st.config.base_url()),
+        "invoice": invoice.map(|invoice| invoice.to_json(&st.config.base_url())).unwrap_or(Value::Null),
     })))
 }

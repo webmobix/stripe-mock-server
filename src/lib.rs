@@ -324,6 +324,7 @@ pub fn build_router(state: AppState) -> Router {
             get(internal::account_secrets),
         )
         .route("/internal/destinations", get(internal::list_destinations))
+        .route("/internal/meter_events", get(internal::list_meter_events))
         .route("/internal/deliveries", get(internal::list_deliveries))
         .route(
             "/internal/deliveries/{id}/retry",

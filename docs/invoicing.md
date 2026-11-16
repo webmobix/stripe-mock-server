@@ -136,6 +136,45 @@ are in minor units and the per-line tax is rounded to the nearest minor unit
 
 The customer's tax ids (see [`billing.md`](billing.md)) are copied to the
 invoice's `customer_tax_ids`, so an invoice carries the tax details on its own.
+Every invoice also reports `total_taxes`, aggregated per applied tax rate:
+
+```json
+"total_taxes": [
+  { "amount": 100, "tax_rate": "txr_...", "taxable_amount": 1000 }
+]
+```
+
+It is an empty array when the invoice has no tax.
+
+## Parent and pricing
+
+A subscription invoice reports `parent` as subscription details carrying the
+subscription id and a snapshot of its metadata:
+
+```json
+"parent": {
+  "type": "subscription_details",
+  "subscription_details": { "subscription": "sub_...", "metadata": { "plan": "team" } }
+}
+```
+
+Each subscription line reports `parent.subscription_item_details` with the
+subscription and item ids. The legacy `subscription` and
+`subscription_item` fields are still reported alongside it.
+
+Lines priced from a catalog price report `pricing`:
+
+```json
+"pricing": {
+  "type": "price_details",
+  "price_details": { "price": "price_...", "product": "prod_..." },
+  "unit_amount_decimal": "4900"
+}
+```
+
+An ad-hoc line without a price reports `pricing: null`. A tiered price has no
+single unit amount, so it reports `pricing.unit_amount_decimal: null` while
+still naming its `price` and `product`. Generic invoices report `parent: null`.
 
 ## Preview the upcoming invoice
 
@@ -154,7 +193,9 @@ The preview has an `upcoming_in_` id, `object=invoice`, `status=draft`,
 `billing_reason=upcoming`, `period_start`/`period_end`, and computed `lines`.
 Licensed items are priced for the next period. Metered items report the usage
 accrued so far in the **current** period, because metered usage is billed in
-arrears. The preview is never listed and has no hosted page or PDF.
+arrears. The preview is never listed and has no hosted page or PDF. It carries
+the same `parent`, line `parent`, line `pricing`, and `total_taxes` fields as
+the persisted invoice it forecasts.
 
 A customer is required, either explicitly or implied by the subscription. Pass
 `subscription_details[items][]` to preview a potential subscription instead of

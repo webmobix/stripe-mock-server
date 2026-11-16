@@ -96,7 +96,26 @@ The `sub_` object includes `status`, `items.data` (each with an embedded price),
 `current_period_end`, matching the subscription period, on create, retrieve,
 list, and update responses. Creating a subscription also raises its first
 invoice with `billing_reason=subscription_create`, a paid status, and one line
-per item. For an account-backed customer:
+per item.
+
+The subscription reports its billing state directly:
+
+- `latest_invoice` names the most recent invoice raised for it, including the
+  `subscription_create` invoice, and is `null` before one exists.
+- `default_payment_method` is the saved card a completed checkout attaches.
+- `cancel_at` mirrors `current_period_end` while `cancel_at_period_end` is
+  true and is `null` otherwise.
+- `canceled_at` and `ended_at` are set when the subscription becomes canceled.
+
+`latest_invoice` and `default_payment_method` support `expand[]`; an expanded
+invoice is the full invoice object, including `hosted_invoice_url`:
+
+```bash
+curl -s "$BASE/v1/subscriptions/$SID?expand[]=latest_invoice&expand[]=default_payment_method" \
+  -H "Authorization: Bearer $KEY"
+```
+
+For an account-backed customer:
 
 ```bash
 curl -s -X POST $BASE/v1/subscriptions \
@@ -111,6 +130,24 @@ A metered price (see [`meters.md`](meters.md)) tracks usage rather than a
 quantity. Omit `items[][quantity]`; supplying one is rejected with
 `invalid_request_error`. The item reports `quantity: null`. Renewal invoices
 bill the usage aggregated over the period that just ended.
+
+### Billing cycle anchor
+
+`billing_cycle_anchor_config[day_of_month]` is accepted as an integer from 1 to
+31 and echoed back on the subscription as
+`billing_cycle_anchor_config.day_of_month`:
+
+```bash
+curl -s -X POST $BASE/v1/subscriptions \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode "customer=$CID" \
+  --data-urlencode "items[0][price]=$PRICE_ID" \
+  --data-urlencode "billing_cycle_anchor_config[day_of_month]=15"
+```
+
+The mock echoes the value but does not align periods to it. A day outside 1–31
+is rejected with an `invalid_request_error` naming the parameter, and no
+subscription is created.
 
 ## End a billing period
 
@@ -134,6 +171,24 @@ When an `open` invoice already exists, the call **retries that invoice** instead
 of advancing again. Calling it with `outcome=paid` after a failure therefore
 models recovery: the same invoice becomes `paid`, `attempt_count` increments,
 and the subscription returns to `active`.
+
+A subscription with `cancel_at_period_end=true` is **canceled** at the boundary
+rather than renewed. The subscription becomes `canceled`, `canceled_at` and
+`ended_at` are set to the period end, `customer.subscription.deleted` is
+emitted, no renewal invoice is raised, and the response reports `invoice: null`:
+
+```json
+{
+  "outcome": "paid",
+  "subscription": {
+    "id": "sub_...",
+    "status": "canceled",
+    "canceled_at": 1762592000,
+    "ended_at": 1762592000
+  },
+  "invoice": null
+}
+```
 
 The full sequence — first invoice, renewal, failure, recovery — is:
 
@@ -177,9 +232,11 @@ curl -s -X POST "$BASE/v1/subscriptions/$SID" \
   --data-urlencode "items[0][quantity]=2"
 ```
 
-The same request may set `cancel_at_period_end` and `metadata`. Unknown item
-ids, unknown prices, and non-positive quantities are rejected with an
-`invalid_request_error` and change nothing.
+The same request may set `cancel_at_period_end` and `metadata`. Turning
+`cancel_at_period_end` on sets `cancel_at` to the current period end; turning it
+off clears `cancel_at` to `null`. Unknown item ids, unknown prices, and
+non-positive quantities are rejected with an `invalid_request_error` and change
+nothing.
 
 ### Prorations
 
@@ -216,8 +273,8 @@ rejected with an `invalid_request_error`.
 - Update → changes items, `cancel_at_period_end`, or `metadata`, emits
   `customer.subscription.updated` with the updated subscription as
   `data.object`.
-- Cancel → `DELETE /v1/subscriptions/{id}` sets `status=canceled` and emits
-  `customer.subscription.deleted`.
+- Cancel → `DELETE /v1/subscriptions/{id}` sets `status=canceled`, stamps
+  `canceled_at` and `ended_at`, and emits `customer.subscription.deleted`.
 
 ## Retrieve and list
 

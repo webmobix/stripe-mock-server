@@ -13,14 +13,15 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 
 use crate::models::{
-    CustomerRow, PaymentIntentRow, PaymentMethodRow, PriceRow, ProductRow, SubscriptionRow,
-    TestClockRow,
+    CustomerRow, InvoiceRow, PaymentIntentRow, PaymentMethodRow, PriceRow, ProductRow,
+    SubscriptionRow, TestClockRow,
 };
 
 /// Expand every path in `paths` over `value`, returning the modified value.
 pub async fn expand_response(
     pool: &SqlitePool,
     account_id: &str,
+    base_url: &str,
     mut value: Value,
     paths: &[String],
 ) -> Value {
@@ -29,7 +30,7 @@ pub async fn expand_response(
         if segments.is_empty() {
             continue;
         }
-        walk(pool, account_id, &mut value, &segments).await;
+        walk(pool, account_id, base_url, &mut value, &segments).await;
     }
     value
 }
@@ -42,14 +43,15 @@ pub async fn expand_response(
 pub async fn expand_list_response(
     pool: &SqlitePool,
     account_id: &str,
+    base_url: &str,
     mut value: Value,
     paths: &[String],
 ) -> Value {
-    value = expand_response(pool, account_id, value, paths).await;
+    value = expand_response(pool, account_id, base_url, value, paths).await;
     if let Some(Value::Array(items)) = value.get_mut("data") {
         for item in items {
             let current = std::mem::take(item);
-            *item = expand_response(pool, account_id, current, paths).await;
+            *item = expand_response(pool, account_id, base_url, current, paths).await;
         }
     }
     value
@@ -58,6 +60,7 @@ pub async fn expand_list_response(
 fn walk<'a>(
     pool: &'a SqlitePool,
     account_id: &'a str,
+    base_url: &'a str,
     slot: &'a mut Value,
     segments: &'a [&'a str],
 ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
@@ -68,18 +71,18 @@ fn walk<'a>(
         match slot {
             Value::Array(items) => {
                 for item in items {
-                    walk(pool, account_id, item, segments).await;
+                    walk(pool, account_id, base_url, item, segments).await;
                 }
             }
             Value::Object(map) => {
                 let Some(child) = map.get_mut(*segment) else {
                     return;
                 };
-                if let Some(object) = resolve(pool, account_id, segment, child).await {
+                if let Some(object) = resolve(pool, account_id, base_url, segment, child).await {
                     *child = object;
                 }
                 if !rest.is_empty() {
-                    walk(pool, account_id, child, rest).await;
+                    walk(pool, account_id, base_url, child, rest).await;
                 }
             }
             _ => {}
@@ -88,7 +91,13 @@ fn walk<'a>(
 }
 
 /// Resolve a reference id held in a field named `field`, scoped to the account.
-async fn resolve(pool: &SqlitePool, account_id: &str, field: &str, value: &Value) -> Option<Value> {
+async fn resolve(
+    pool: &SqlitePool,
+    account_id: &str,
+    base_url: &str,
+    field: &str,
+    value: &Value,
+) -> Option<Value> {
     let id = value.as_str()?;
     match field {
         "product" if id.starts_with("prod_") => {
@@ -161,6 +170,16 @@ async fn resolve(pool: &SqlitePool, account_id: &str, field: &str, value: &Value
                     .ok()??;
             Some(row.to_json())
         }
+        "latest_invoice" if id.starts_with("in_") => {
+            let row: InvoiceRow =
+                sqlx::query_as("SELECT * FROM invoices WHERE id = ?1 AND account_id = ?2")
+                    .bind(id)
+                    .bind(account_id)
+                    .fetch_optional(pool)
+                    .await
+                    .ok()??;
+            Some(row.to_json(base_url))
+        }
         _ => None,
     }
 }
@@ -201,7 +220,14 @@ mod tests {
                 ]
             }
         });
-        value = expand_response(&pool, "acct_1", value, &["items.data.price.product".into()]).await;
+        value = expand_response(
+            &pool,
+            "acct_1",
+            "http://127.0.0.1:12111",
+            value,
+            &["items.data.price.product".into()],
+        )
+        .await;
         assert_eq!(
             value["items"]["data"][0]["price"]["product"]["id"],
             "prod_1"
@@ -227,7 +253,14 @@ mod tests {
                 { "id": "price_2", "product": "prod_1" }
             ]
         });
-        let value = expand_list_response(&pool, "acct_1", value, &["data.product".into()]).await;
+        let value = expand_list_response(
+            &pool,
+            "acct_1",
+            "http://127.0.0.1:12111",
+            value,
+            &["data.product".into()],
+        )
+        .await;
         assert_eq!(value["data"][0]["product"]["id"], "prod_1");
         assert_eq!(value["data"][0]["product"]["object"], "product");
         assert_eq!(value["data"][1]["product"]["id"], "prod_1");
@@ -244,7 +277,14 @@ mod tests {
                 { "id": "price_2", "product": "prod_1" }
             ]
         });
-        let value = expand_list_response(&pool, "acct_1", value, &["product".into()]).await;
+        let value = expand_list_response(
+            &pool,
+            "acct_1",
+            "http://127.0.0.1:12111",
+            value,
+            &["product".into()],
+        )
+        .await;
         assert_eq!(value["data"][0]["product"]["id"], "prod_1");
         assert_eq!(value["data"][1]["product"]["object"], "product");
     }
@@ -269,6 +309,7 @@ mod tests {
         let value = expand_list_response(
             &pool,
             "acct_1",
+            "http://127.0.0.1:12111",
             value,
             &["data.items.data.price.product".into()],
         )
@@ -288,7 +329,14 @@ mod tests {
         let pool = pool().await;
         let expanded = json!({"id": "prod_1", "object": "product"});
         let mut value = json!({ "product": expanded.clone() });
-        value = expand_response(&pool, "acct_1", value, &["product".into()]).await;
+        value = expand_response(
+            &pool,
+            "acct_1",
+            "http://127.0.0.1:12111",
+            value,
+            &["product".into()],
+        )
+        .await;
         assert_eq!(value["product"], expanded);
     }
 
@@ -296,7 +344,14 @@ mod tests {
     async fn unknown_paths_are_untouched() {
         let pool = pool().await;
         let mut value = json!({ "id": "price_1", "product": "prod_1" });
-        value = expand_response(&pool, "acct_1", value, &["does.not.exist".into()]).await;
+        value = expand_response(
+            &pool,
+            "acct_1",
+            "http://127.0.0.1:12111",
+            value,
+            &["does.not.exist".into()],
+        )
+        .await;
         assert_eq!(value["product"], "prod_1");
         assert!(value.get("does").is_none());
     }
@@ -306,7 +361,14 @@ mod tests {
         let pool = pool().await;
         add_product(&pool, "acct_2", "prod_other").await;
         let mut value = json!({ "product": "prod_other" });
-        value = expand_response(&pool, "acct_1", value, &["product".into()]).await;
+        value = expand_response(
+            &pool,
+            "acct_1",
+            "http://127.0.0.1:12111",
+            value,
+            &["product".into()],
+        )
+        .await;
         assert_eq!(value["product"], "prod_other");
     }
 
@@ -325,14 +387,55 @@ mod tests {
             .unwrap();
         }
         let mut value = json!({ "test_clock": "clock_mine" });
-        value = expand_response(&pool, "acct_1", value, &["test_clock".into()]).await;
+        value = expand_response(
+            &pool,
+            "acct_1",
+            "http://127.0.0.1:12111",
+            value,
+            &["test_clock".into()],
+        )
+        .await;
         assert_eq!(value["test_clock"]["id"], "clock_mine");
         assert_eq!(value["test_clock"]["object"], "test_helpers.test_clock");
         assert_eq!(value["test_clock"]["frozen_time"], 0);
 
         let mut other = json!({ "test_clock": "clock_other" });
-        other = expand_response(&pool, "acct_1", other, &["test_clock".into()]).await;
+        other = expand_response(
+            &pool,
+            "acct_1",
+            "http://127.0.0.1:12111",
+            other,
+            &["test_clock".into()],
+        )
+        .await;
         assert_eq!(other["test_clock"], "clock_other");
+    }
+
+    #[tokio::test]
+    async fn expands_latest_invoice_with_a_rendered_invoice() {
+        let pool = pool().await;
+        sqlx::query(
+            "INSERT INTO invoices (id, account_id, customer, status, created, updated) \
+             VALUES ('in_1', 'acct_1', 'cus_1', 'paid', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut value = json!({ "latest_invoice": "in_1" });
+        value = expand_response(
+            &pool,
+            "acct_1",
+            "http://127.0.0.1:12111",
+            value,
+            &["latest_invoice".into()],
+        )
+        .await;
+        assert_eq!(value["latest_invoice"]["object"], "invoice");
+        assert_eq!(value["latest_invoice"]["id"], "in_1");
+        assert_eq!(
+            value["latest_invoice"]["hosted_invoice_url"],
+            "http://127.0.0.1:12111/mock/invoices/in_1"
+        );
     }
 
     #[tokio::test]
@@ -348,7 +451,14 @@ mod tests {
         .unwrap();
         // A subscription item whose price is still a bare id.
         let mut value = json!({ "items": { "data": [ { "price": "price_1" } ] } });
-        value = expand_response(&pool, "acct_1", value, &["items.data.price.product".into()]).await;
+        value = expand_response(
+            &pool,
+            "acct_1",
+            "http://127.0.0.1:12111",
+            value,
+            &["items.data.price.product".into()],
+        )
+        .await;
         assert_eq!(value["items"]["data"][0]["price"]["id"], "price_1");
         assert_eq!(
             value["items"]["data"][0]["price"]["product"]["id"],

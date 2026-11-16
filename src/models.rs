@@ -628,6 +628,12 @@ pub struct SubscriptionRow {
     pub items: String,
     pub metadata: Option<String>,
     pub test_clock: Option<String>,
+    pub latest_invoice: Option<String>,
+    pub default_payment_method: Option<String>,
+    pub cancel_at: Option<i64>,
+    pub canceled_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub billing_cycle_anchor_config: Option<String>,
 }
 
 impl SubscriptionRow {
@@ -658,11 +664,17 @@ impl SubscriptionRow {
             "id": self.id,
             "object": "subscription",
             "cancel_at_period_end": self.cancel_at_period_end != 0,
+            "cancel_at": self.cancel_at,
+            "canceled_at": self.canceled_at,
             "created": self.created,
             "current_period_start": self.current_period_start,
             "current_period_end": self.current_period_end,
             "customer": self.customer,
             "customer_account": self.customer_account,
+            "default_payment_method": self.default_payment_method,
+            "ended_at": self.ended_at,
+            "latest_invoice": self.latest_invoice,
+            "billing_cycle_anchor_config": parse_json(&self.billing_cycle_anchor_config),
             "livemode": false,
             "metadata": parse_json_or_empty(&self.metadata),
             "status": self.status,
@@ -705,6 +717,8 @@ pub struct CheckoutSessionRow {
     pub return_url: Option<String>,
     pub client_secret: Option<String>,
     pub subscription_metadata: Option<String>,
+    pub payment_method_collection: String,
+    pub automatic_tax: Option<String>,
 }
 
 impl CheckoutSessionRow {
@@ -726,6 +740,16 @@ impl CheckoutSessionRow {
             .as_array()
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The echoed `automatic_tax` object: the stored enabled flag plus the
+    /// currently unsupported automatic-tax `status`.
+    fn automatic_tax(&self) -> Value {
+        let enabled = parse_json(&self.automatic_tax)
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        json!({ "enabled": enabled, "status": null })
     }
 
     /// Aggregate the stored per-line tax amounts by tax-rate id.
@@ -799,6 +823,7 @@ impl CheckoutSessionRow {
             "amount_total": amount_total,
             "amount_discount": amount_discount,
             "amount_tax": amount_tax,
+            "automatic_tax": self.automatic_tax(),
             "cancel_url": self.cancel_url,
             "created": self.created,
             "currency": self.currency,
@@ -820,6 +845,7 @@ impl CheckoutSessionRow {
             "metadata": parse_json_or_empty(&self.metadata),
             "mode": self.mode,
             "payment_intent": self.payment_intent,
+            "payment_method_collection": self.payment_method_collection,
             "payment_status": if self.status == "complete" { "paid" } else { "unpaid" },
             "return_url": self.return_url,
             "status": self.status,
@@ -882,6 +908,7 @@ pub struct InvoiceRow {
     pub attempt_count: i64,
     pub payment_intent: Option<String>,
     pub test_clock: Option<String>,
+    pub subscription_metadata: Option<String>,
 }
 
 impl InvoiceRow {
@@ -891,6 +918,71 @@ impl InvoiceRow {
             .as_array()
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The snapshot of the subscription's metadata taken when the invoice was
+    /// raised.
+    fn subscription_metadata_value(&self) -> Value {
+        match parse_json(&self.subscription_metadata) {
+            Value::Object(map) => Value::Object(map),
+            _ => json!({}),
+        }
+    }
+
+    /// The invoice's `parent`: subscription details for a subscription invoice,
+    /// otherwise null.
+    fn parent(&self) -> Value {
+        match &self.subscription {
+            Some(subscription) => json!({
+                "type": "subscription_details",
+                "subscription_details": {
+                    "metadata": self.subscription_metadata_value(),
+                    "subscription": subscription,
+                },
+            }),
+            None => Value::Null,
+        }
+    }
+
+    /// Tax totals aggregated per applied tax rate across the lines.
+    pub fn total_taxes(&self) -> Vec<Value> {
+        let mut totals: Vec<(String, i64, i64)> = Vec::new();
+        for line in self.line_list() {
+            let Some(amounts) = line.get("tax_amounts").and_then(Value::as_array) else {
+                continue;
+            };
+            for amount in amounts {
+                let rate = amount.get("tax_rate").cloned().unwrap_or(Value::Null);
+                let rate_id = rate
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .or_else(|| rate.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let tax = amount.get("amount").and_then(Value::as_i64).unwrap_or(0);
+                let taxable = amount
+                    .get("taxable_amount")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                match totals.iter_mut().find(|(id, _, _)| id == &rate_id) {
+                    Some((_, total, taxable_total)) => {
+                        *total += tax;
+                        *taxable_total += taxable;
+                    }
+                    None => totals.push((rate_id, tax, taxable)),
+                }
+            }
+        }
+        totals
+            .into_iter()
+            .map(|(rate, amount, taxable_amount)| {
+                json!({
+                    "amount": amount,
+                    "tax_rate": rate,
+                    "taxable_amount": taxable_amount,
+                })
+            })
+            .collect()
     }
 
     pub fn to_json(&self, base_url: &str) -> Value {
@@ -930,6 +1022,7 @@ impl InvoiceRow {
             "number": Value::Null,
             "paid": self.status == "paid",
             "paid_at": self.paid_at,
+            "parent": self.parent(),
             "payment_intent": self.payment_intent,
             "period_end": self.period_end,
             "period_start": self.period_start,
@@ -939,6 +1032,7 @@ impl InvoiceRow {
             "tax_total": self.tax_total,
             "test_clock": self.test_clock,
             "total": self.total,
+            "total_taxes": self.total_taxes(),
             "updated": self.updated,
             "voided_at": self.voided_at,
         })
@@ -1352,6 +1446,8 @@ mod tests {
             return_url: None,
             client_secret: None,
             subscription_metadata: None,
+            payment_method_collection: "always".into(),
+            automatic_tax: Some(r#"{"enabled":false}"#.into()),
         }
     }
 
@@ -1427,6 +1523,60 @@ mod tests {
         assert_eq!(json["amount_tax"], 0);
         assert_eq!(json["discounts"], json!([]));
         assert_eq!(json["total_details"]["breakdown"]["taxes"], json!([]));
+    }
+
+    #[test]
+    fn checkout_echoes_payment_method_collection_and_automatic_tax() {
+        let json = checkout(None).to_json();
+        assert_eq!(json["payment_method_collection"], "always");
+        assert_eq!(json["automatic_tax"]["enabled"], false);
+        assert_eq!(json["automatic_tax"]["status"], Value::Null);
+
+        let mut row = checkout(None);
+        row.payment_method_collection = "if_required".into();
+        row.automatic_tax = Some(r#"{"enabled":true}"#.into());
+        let json = row.to_json();
+        assert_eq!(json["payment_method_collection"], "if_required");
+        assert_eq!(json["automatic_tax"]["enabled"], true);
+        assert_eq!(json["automatic_tax"]["status"], Value::Null);
+
+        // A row from before the columns existed renders the defaults.
+        let mut legacy = checkout(None);
+        legacy.automatic_tax = None;
+        let json = legacy.to_json();
+        assert_eq!(json["automatic_tax"]["enabled"], false);
+        assert_eq!(json["automatic_tax"]["status"], Value::Null);
+    }
+
+    #[test]
+    fn subscription_renders_billing_fields_with_null_defaults() {
+        let row = SubscriptionRow {
+            id: "sub_1".into(),
+            account_id: "acct_1".into(),
+            customer: Some("cus_1".into()),
+            customer_account: None,
+            status: "active".into(),
+            created: 90,
+            current_period_start: Some(100),
+            current_period_end: Some(200),
+            cancel_at_period_end: 0,
+            items: "[]".into(),
+            metadata: Some("{}".into()),
+            test_clock: None,
+            latest_invoice: None,
+            default_payment_method: None,
+            cancel_at: None,
+            canceled_at: None,
+            ended_at: None,
+            billing_cycle_anchor_config: None,
+        };
+        let json = row.to_json();
+        assert_eq!(json["latest_invoice"], Value::Null);
+        assert_eq!(json["default_payment_method"], Value::Null);
+        assert_eq!(json["cancel_at"], Value::Null);
+        assert_eq!(json["canceled_at"], Value::Null);
+        assert_eq!(json["ended_at"], Value::Null);
+        assert_eq!(json["billing_cycle_anchor_config"], Value::Null);
     }
 
     #[test]
@@ -1515,6 +1665,7 @@ mod tests {
             attempt_count: 0,
             payment_intent: None,
             test_clock: None,
+            subscription_metadata: None,
         }
     }
 
@@ -1652,6 +1803,12 @@ mod tests {
             items: serde_json::to_string(&json!([new_item])).unwrap(),
             metadata: Some("{}".into()),
             test_clock: None,
+            latest_invoice: None,
+            default_payment_method: None,
+            cancel_at: None,
+            canceled_at: None,
+            ended_at: None,
+            billing_cycle_anchor_config: None,
         };
         let json = row.to_json();
         let item = &json["items"]["data"][0];

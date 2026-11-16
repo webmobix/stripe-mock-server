@@ -140,7 +140,8 @@ CREATE TABLE IF NOT EXISTS invoices (
     collection_method TEXT NOT NULL DEFAULT 'send_invoice',
     attempt_count INTEGER NOT NULL DEFAULT 0,
     payment_intent TEXT,
-    test_clock TEXT
+    test_clock TEXT,
+    subscription_metadata TEXT
 );
 
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -155,7 +156,13 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
     items TEXT NOT NULL,
     metadata TEXT,
-    test_clock TEXT
+    test_clock TEXT,
+    latest_invoice TEXT,
+    default_payment_method TEXT,
+    cancel_at INTEGER,
+    canceled_at INTEGER,
+    ended_at INTEGER,
+    billing_cycle_anchor_config TEXT
 );
 
 CREATE TABLE IF NOT EXISTS checkout_sessions (
@@ -184,7 +191,9 @@ CREATE TABLE IF NOT EXISTS checkout_sessions (
     ui_mode TEXT NOT NULL DEFAULT 'hosted_page',
     return_url TEXT,
     client_secret TEXT,
-    subscription_metadata TEXT
+    subscription_metadata TEXT,
+    payment_method_collection TEXT NOT NULL DEFAULT 'always',
+    automatic_tax TEXT NOT NULL DEFAULT '{"enabled":false}'
 );
 
 CREATE TABLE IF NOT EXISTS coupons (
@@ -434,6 +443,14 @@ async fn migrate_legacy_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         ("return_url", "TEXT"),
         ("client_secret", "TEXT"),
         ("subscription_metadata", "TEXT"),
+        (
+            "payment_method_collection",
+            "TEXT NOT NULL DEFAULT 'always'",
+        ),
+        (
+            "automatic_tax",
+            "TEXT NOT NULL DEFAULT '{\"enabled\":false}'",
+        ),
     ] {
         add_column_if_missing(pool, "checkout_sessions", column, decl).await?;
     }
@@ -461,8 +478,21 @@ async fn migrate_legacy_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         ("collection_method", "TEXT NOT NULL DEFAULT 'send_invoice'"),
         ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
         ("payment_intent", "TEXT"),
+        ("subscription_metadata", "TEXT"),
     ] {
         add_column_if_missing(pool, "invoices", column, decl).await?;
+    }
+    // Subscription presentation fields: the latest invoice, default payment
+    // method, scheduled cancellation, and the echoed billing cycle anchor.
+    for (column, decl) in [
+        ("latest_invoice", "TEXT"),
+        ("default_payment_method", "TEXT"),
+        ("cancel_at", "INTEGER"),
+        ("canceled_at", "INTEGER"),
+        ("ended_at", "INTEGER"),
+        ("billing_cycle_anchor_config", "TEXT"),
+    ] {
+        add_column_if_missing(pool, "subscriptions", column, decl).await?;
     }
     Ok(())
 }
@@ -690,6 +720,32 @@ mod tests {
             assert!(
                 has_column(&pool, table, "test_clock").await.unwrap(),
                 "{table}.test_clock was not migrated"
+            );
+        }
+        for column in [
+            "latest_invoice",
+            "default_payment_method",
+            "cancel_at",
+            "canceled_at",
+            "ended_at",
+            "billing_cycle_anchor_config",
+        ] {
+            assert!(
+                has_column(&pool, "subscriptions", column).await.unwrap(),
+                "subscriptions.{column} was not migrated"
+            );
+        }
+        assert!(
+            has_column(&pool, "invoices", "subscription_metadata")
+                .await
+                .unwrap()
+        );
+        for column in ["payment_method_collection", "automatic_tax"] {
+            assert!(
+                has_column(&pool, "checkout_sessions", column)
+                    .await
+                    .unwrap(),
+                "checkout_sessions.{column} was not migrated"
             );
         }
         // The new table is usable after the migration.

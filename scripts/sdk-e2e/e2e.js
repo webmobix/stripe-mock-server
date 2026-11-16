@@ -541,6 +541,24 @@ const postForm = (url, params) =>
   if (summaryTotal !== 12) throw new Error(`bad meter summary: ${summaryTotal}`);
   console.log('meter summary', summaryTotal);
 
+  // Accepted raw events are inspectable through the control plane.
+  const inspected = await (
+    await fetch(
+      `${MOCK}/internal/meter_events?event_name=sdk_api_call&customer=${taxCustomer.id}`,
+    )
+  ).json();
+  if (inspected.object !== 'list') throw new Error('bad meter event envelope');
+  const inspectedEvent = inspected.data.find((event) => event.identifier === 'sdk-usage-1');
+  if (!inspectedEvent) throw new Error('accepted meter event is not inspectable');
+  if (inspectedEvent.value !== '12') throw new Error(`bad inspected meter value: ${inspectedEvent.value}`);
+  if (!inspectedEvent.timestamp) throw new Error('inspected meter event has no timestamp');
+  if (inspectedEvent.customer !== taxCustomer.id) throw new Error('inspected meter customer mismatch');
+  const allMeterEvents = await (await fetch(`${MOCK}/internal/meter_events`)).json();
+  if (!allMeterEvents.data.some((event) => event.identifier === 'sdk-usage-1')) {
+    throw new Error('unfiltered meter event list is missing the event');
+  }
+  console.log('inspected meter events', inspected.data.length, allMeterEvents.data.length);
+
   const meteredPrice = await stripe.prices.create({
     product: mainProduct.id,
     currency: 'usd',
@@ -593,12 +611,102 @@ const postForm = (url, params) =>
   if (completedSession.status !== 'complete') throw new Error('embedded session not complete');
   const embeddedSubscription = await stripe.subscriptions.retrieve(completedSession.subscription);
   if (embeddedSubscription.metadata.plan !== 'sdk-team') throw new Error('subscription metadata missing');
+  const expandedSubscription = await stripe.subscriptions.retrieve(completedSession.subscription, {
+    expand: ['latest_invoice', 'default_payment_method'],
+  });
+  if (typeof expandedSubscription.latest_invoice !== 'object' || !expandedSubscription.latest_invoice) {
+    throw new Error('latest_invoice did not expand to an invoice');
+  }
+  if (expandedSubscription.latest_invoice.billing_reason !== 'subscription_create') {
+    throw new Error('expanded latest_invoice is not the first invoice');
+  }
+  if (expandedSubscription.latest_invoice.object !== 'invoice') {
+    throw new Error('expanded latest_invoice has the wrong object');
+  }
+  if (typeof expandedSubscription.default_payment_method !== 'object') {
+    throw new Error('default_payment_method did not expand to a payment method');
+  }
+  if (expandedSubscription.default_payment_method.card.last4 !== '4242') {
+    throw new Error('subscription default card missing');
+  }
+  const subscriptionInvoice = expandedSubscription.latest_invoice;
+  if (
+    subscriptionInvoice.parent.subscription_details.subscription !==
+    completedSession.subscription
+  ) {
+    throw new Error('invoice parent does not name the subscription');
+  }
+  if (subscriptionInvoice.parent.subscription_details.metadata.plan !== 'sdk-team') {
+    throw new Error('invoice parent metadata missing');
+  }
+  if (!Array.isArray(subscriptionInvoice.total_taxes)) throw new Error('total_taxes missing');
+  const subscriptionLine = subscriptionInvoice.lines.data[0];
+  if (subscriptionLine.parent.subscription_item_details.subscription !== completedSession.subscription) {
+    throw new Error('line parent does not name the subscription');
+  }
+  if (subscriptionLine.pricing.price_details.price !== mainPrice.id) {
+    throw new Error('line pricing does not name the price');
+  }
+  if (!subscriptionLine.pricing.unit_amount_decimal) throw new Error('line unit amount missing');
+  const subscriptionPreview = await stripe.invoices.createPreview({
+    customer: taxCustomer.id,
+    subscription: completedSession.subscription,
+  });
+  if (
+    subscriptionPreview.parent.subscription_details.subscription !== completedSession.subscription
+  ) {
+    throw new Error('preview parent does not name the subscription');
+  }
+  if (subscriptionPreview.lines.data[0].pricing.price_details.price !== mainPrice.id) {
+    throw new Error('preview line pricing missing');
+  }
+  console.log(
+    'expanded subscription',
+    expandedSubscription.latest_invoice.id,
+    expandedSubscription.default_payment_method.id,
+    subscriptionLine.pricing.unit_amount_decimal,
+  );
   const cardCustomer = await stripe.customers.retrieve(taxCustomer.id, {
     expand: ['invoice_settings.default_payment_method'],
   });
   const defaultCard = cardCustomer.invoice_settings.default_payment_method;
   if (defaultCard.card.last4 !== '4242') throw new Error('default card missing');
   console.log('default card', defaultCard.id, defaultCard.card.brand, defaultCard.card.last4);
+
+  // --- cancel at period end is honored by a direct advance ----------------
+  const cancelling = await stripe.subscriptions.create({
+    customer: mainCustomer.id,
+    items: [{ price: mainPrice.id }],
+  });
+  const scheduled = await stripe.subscriptions.update(cancelling.id, {
+    cancel_at_period_end: true,
+  });
+  if (scheduled.cancel_at_period_end !== true) throw new Error('cancel_at_period_end missing');
+  if (scheduled.cancel_at !== scheduled.current_period_end) {
+    throw new Error(`cancel_at does not match the period end: ${scheduled.cancel_at}`);
+  }
+  const advanced = await (
+    await fetch(`${MOCK}/internal/subscriptions/${cancelling.id}/advance`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ outcome: 'paid' }),
+    })
+  ).json();
+  if (advanced.invoice !== null) throw new Error('cancellation-advance raised an invoice');
+  if (advanced.subscription.status !== 'canceled') throw new Error('subscription was not canceled');
+  if (!advanced.subscription.canceled_at || !advanced.subscription.ended_at) {
+    throw new Error('cancellation timestamps missing');
+  }
+  const cancellingInvoices = await stripe.invoices.list({ subscription: cancelling.id });
+  if (cancellingInvoices.data.some((i) => i.billing_reason === 'subscription_cycle')) {
+    throw new Error('cancellation-advance raised a renewal invoice');
+  }
+  console.log(
+    'cancellation on advance',
+    advanced.subscription.status,
+    advanced.subscription.canceled_at,
+    advanced.invoice,
+  );
 
   const idemOptions = { idempotencyKey: 'sdk-idempotency-1' };
   const idemCustomer = await stripe.customers.create({ email: 'sdk-idem@example.com' }, idemOptions);

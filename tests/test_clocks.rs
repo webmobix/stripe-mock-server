@@ -1304,6 +1304,8 @@ async fn cancel_at_period_end_stops_at_the_boundary() {
         .unwrap();
     assert_eq!(canceled["status"], "canceled");
     assert_eq!(canceled["current_period_end"], FROZEN + MONTH);
+    assert_eq!(canceled["canceled_at"], FROZEN + MONTH);
+    assert_eq!(canceled["ended_at"], FROZEN + MONTH);
 
     // No renewal invoice was raised for the canceled subscription.
     let invoices = subscription_invoices(&server, &key, subscription_id).await;
@@ -1321,6 +1323,30 @@ async fn cancel_at_period_end_stops_at_the_boundary() {
         .await
         .unwrap();
     assert_eq!(events["data"][0]["created"], FROZEN + MONTH);
+}
+
+#[tokio::test]
+async fn deleting_a_clock_subscription_stamps_the_frozen_time() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let (_clock, customer) = create_clock_customer(&server, &key, FROZEN).await;
+    let price = create_recurring_price(&server, &key, "month", 1000).await;
+    let subscription = create_clock_subscription(&server, &key, &customer, &price).await;
+    let id = subscription["id"].as_str().unwrap();
+
+    let canceled: Value = server
+        .client
+        .delete(server.url(&format!("/v1/subscriptions/{id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(canceled["status"], "canceled");
+    assert_eq!(canceled["canceled_at"], FROZEN);
+    assert_eq!(canceled["ended_at"], FROZEN);
 }
 
 #[tokio::test]
@@ -1404,6 +1430,8 @@ async fn deleting_a_clock_cancels_and_removes_its_objects() {
         .await
         .unwrap();
     assert_eq!(canceled["status"], "canceled");
+    assert_eq!(canceled["canceled_at"], FROZEN);
+    assert_eq!(canceled["ended_at"], FROZEN);
 
     // The customer and its payment method are gone.
     let customer_response = server

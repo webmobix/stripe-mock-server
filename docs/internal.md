@@ -79,6 +79,24 @@ curl -s -X POST $BASE/internal/deliveries/flush \
 curl -s -X POST $BASE/internal/deliveries/dl_.../retry
 ```
 
+## Inspect meter events
+
+`GET /internal/meter_events` returns accepted raw meter events without Stripe
+authentication. It accepts `event_name` and `customer` filters and answers with
+a v1 list envelope:
+
+```bash
+curl -s "$BASE/internal/meter_events?event_name=api_call&customer=cus_..."
+# {"object":"list","data":[
+#   {"identifier":"request-0001","event_name":"api_call","customer":"cus_...",
+#    "value":"10","timestamp":1760000000}
+# ],"has_more":false,"url":"/internal/meter_events"}
+```
+
+Each item carries the client `identifier`, `event_name`, the mapped customer id,
+the reported `value` as a string, and `timestamp`. With no filters every
+accepted event is returned. See [`meters.md`](meters.md#inspect-accepted-events).
+
 ## Settling a payment intent
 
 A test resolves a payment intent through the control plane. When the intent
@@ -107,9 +125,23 @@ curl -s -X POST $BASE/internal/subscriptions/sub_.../advance \
 period, raises a `subscription_cycle` invoice, and sets the subscription
 `active` or `past_due`. With an open invoice it retries that invoice instead, so
 `failed` followed by `paid` models failure and recovery. The response carries
-the updated `subscription` and the `invoice`. See
-[`billing.md`](billing.md#end-a-billing-period). For a clock-wide advance that
-renews every subscription attached to a [test clock](test-clocks.md), use
+the updated `subscription` and the `invoice`.
+
+A subscription with `cancel_at_period_end=true` is canceled at the boundary
+instead of renewed: `status` becomes `canceled`, `canceled_at` and `ended_at`
+are set to the period end, `customer.subscription.deleted` is emitted, no
+renewal invoice is raised, and the response reports `invoice: null`:
+
+```json
+{
+  "outcome": "paid",
+  "subscription": { "id": "sub_...", "status": "canceled", "canceled_at": 1762592000, "ended_at": 1762592000 },
+  "invoice": null
+}
+```
+
+See [`billing.md`](billing.md#end-a-billing-period). For a clock-wide advance
+that renews every subscription attached to a [test clock](test-clocks.md), use
 `POST /v1/test_helpers/test_clocks/{id}/advance`.
 
 ## Reset

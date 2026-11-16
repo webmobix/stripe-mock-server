@@ -279,6 +279,19 @@ async fn metered_and_tiered_prices_reject_quantities_and_price_invoices() {
     assert_eq!(renewal["invoice"]["billing_reason"], "subscription_cycle");
     assert_eq!(renewal["invoice"]["total"], 14);
     assert_eq!(renewal["invoice"]["lines"]["data"][0]["quantity"], 7);
+    let renewal_line = &renewal["invoice"]["lines"]["data"][0];
+    assert_eq!(renewal_line["parent"]["type"], "subscription_item_details");
+    assert_eq!(
+        renewal_line["parent"]["subscription_item_details"]["subscription"],
+        subscription_id
+    );
+    assert_eq!(
+        renewal_line["parent"]["subscription_item_details"]["subscription_item"],
+        subscription["items"]["data"][0]["id"]
+    );
+    assert_eq!(renewal_line["pricing"]["type"], "price_details");
+    assert_eq!(renewal_line["pricing"]["price_details"]["price"], metered);
+    assert_eq!(renewal_line["pricing"]["unit_amount_decimal"], "2");
 
     // Graduated tiers: 10 units at 100 plus 15 at 50.
     let tiered_subscription: Value = server
@@ -308,6 +321,11 @@ async fn metered_and_tiered_prices_reject_quantities_and_price_invoices() {
         .await
         .unwrap();
     assert_eq!(tiered_invoices["data"][0]["total"], 1750);
+    // A tiered price has no single unit amount, so pricing reports null rather
+    // than the line total.
+    let tiered_line = &tiered_invoices["data"][0]["lines"]["data"][0];
+    assert_eq!(tiered_line["pricing"]["price_details"]["price"], tiered);
+    assert_eq!(tiered_line["pricing"]["unit_amount_decimal"], Value::Null);
 }
 
 #[tokio::test]
@@ -332,6 +350,8 @@ async fn embedded_checkout_returns_a_client_secret_and_saves_a_card() {
             ("line_items[0][price]", tiered.as_str()),
             ("line_items[0][quantity]", "3"),
             ("subscription_data[metadata][plan]", "team"),
+            ("payment_method_collection", "if_required"),
+            ("automatic_tax[enabled]", "true"),
         ])
         .send()
         .await
@@ -341,6 +361,9 @@ async fn embedded_checkout_returns_a_client_secret_and_saves_a_card() {
         .unwrap();
     assert_eq!(session["ui_mode"], "embedded_page");
     assert_eq!(session["url"], Value::Null);
+    assert_eq!(session["payment_method_collection"], "if_required");
+    assert_eq!(session["automatic_tax"]["enabled"], true);
+    assert_eq!(session["automatic_tax"]["status"], Value::Null);
     let client_secret = session["client_secret"].as_str().unwrap();
     assert!(client_secret.starts_with(session["id"].as_str().unwrap()));
     let session_id = session["id"].as_str().unwrap().to_string();
@@ -375,10 +398,15 @@ async fn embedded_checkout_returns_a_client_secret_and_saves_a_card() {
         .await
         .unwrap();
     assert_eq!(completed["status"], "complete");
+    assert_eq!(completed["payment_method_collection"], "if_required");
+    assert_eq!(completed["automatic_tax"]["enabled"], true);
+    assert_eq!(completed["automatic_tax"]["status"], Value::Null);
     let subscription_id = completed["subscription"].as_str().unwrap();
     let subscription: Value = server
         .client
-        .get(server.url(&format!("/v1/subscriptions/{subscription_id}")))
+        .get(server.url(&format!(
+            "/v1/subscriptions/{subscription_id}?expand[]=latest_invoice&expand[]=default_payment_method"
+        )))
         .header("Authorization", format!("Bearer {key}"))
         .send()
         .await
@@ -387,6 +415,35 @@ async fn embedded_checkout_returns_a_client_secret_and_saves_a_card() {
         .await
         .unwrap();
     assert_eq!(subscription["metadata"]["plan"], "team");
+    let card_id = subscription["default_payment_method"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(card_id.starts_with("pm_"));
+    assert_eq!(
+        subscription["default_payment_method"]["card"]["last4"],
+        "4242"
+    );
+    let latest_invoice = subscription["latest_invoice"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(subscription["latest_invoice"]["object"], "invoice");
+
+    let created_events: Value = server
+        .client
+        .get(server.url("/v1/events?type=customer.subscription.created"))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let created = &created_events["data"][0]["data"]["object"];
+    assert_eq!(created["id"], subscription_id);
+    assert_eq!(created["default_payment_method"], card_id);
+    assert_eq!(created["latest_invoice"], latest_invoice);
 
     let stored_customer: Value = server
         .client
@@ -438,6 +495,68 @@ async fn embedded_checkout_returns_a_client_secret_and_saves_a_card() {
         .await
         .unwrap();
     assert_eq!(upcoming["billing_reason"], "upcoming");
+}
+
+#[tokio::test]
+async fn checkout_echoes_defaults_and_rejects_an_unsupported_collection() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "echo@example.com").await;
+    let product = create_product(&server, &key, "Monthly").await;
+    let price: Value = server
+        .client
+        .post(server.url("/v1/prices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("product", product.as_str()),
+            ("currency", "usd"),
+            ("unit_amount", "1000"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let price_id = price["id"].as_str().unwrap().to_string();
+
+    let session: Value = server
+        .client
+        .post(server.url("/v1/checkout/sessions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("mode", "payment"),
+            ("customer", customer.as_str()),
+            ("line_items[0][price]", price_id.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["payment_method_collection"], "always");
+    assert_eq!(session["automatic_tax"]["enabled"], false);
+    assert_eq!(session["automatic_tax"]["status"], Value::Null);
+
+    let rejected: Value = server
+        .client
+        .post(server.url("/v1/checkout/sessions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("mode", "payment"),
+            ("customer", customer.as_str()),
+            ("line_items[0][price]", price_id.as_str()),
+            ("payment_method_collection", "never"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rejected["error"]["type"], "invalid_request_error");
+    assert_eq!(rejected["error"]["param"], "payment_method_collection");
 }
 
 #[tokio::test]
@@ -495,6 +614,20 @@ async fn failed_renewal_can_be_recovered_without_raising_another_invoice() {
     assert_eq!(failed["invoice"]["attempt_count"], 1);
     let invoice_id = failed["invoice"]["id"].as_str().unwrap().to_string();
 
+    // The updated event names the invoice the advance just raised.
+    let updated_events: Value = server
+        .client
+        .get(server.url("/v1/events?type=customer.subscription.updated"))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let updated = &updated_events["data"][0]["data"]["object"];
+    assert_eq!(updated["latest_invoice"], invoice_id);
+
     let recovered: Value = server
         .client
         .post(server.url(&format!("/internal/subscriptions/{id}/advance")))
@@ -521,6 +654,582 @@ async fn failed_renewal_can_be_recovered_without_raising_another_invoice() {
         .await
         .unwrap();
     assert_eq!(invoices["data"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn subscription_creation_reports_its_first_invoice() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "latest@example.com").await;
+    let product = create_product(&server, &key, "Monthly").await;
+    let price: Value = server
+        .client
+        .post(server.url("/v1/prices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("product", product.as_str()),
+            ("currency", "usd"),
+            ("recurring[interval]", "month"),
+            ("unit_amount", "1000"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let price_id = price["id"].as_str().unwrap().to_string();
+
+    let subscription: Value = server
+        .client
+        .post(server.url("/v1/subscriptions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("items[0][price]", price_id.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let subscription_id = subscription["id"].as_str().unwrap().to_string();
+    let latest_invoice = subscription["latest_invoice"].as_str().unwrap().to_string();
+
+    let invoice: Value = server
+        .client
+        .get(server.url(&format!("/v1/invoices/{latest_invoice}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(invoice["billing_reason"], "subscription_create");
+    assert_eq!(invoice["subscription"], subscription_id);
+
+    let events: Value = server
+        .client
+        .get(server.url("/v1/events?type=customer.subscription.created"))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let created = &events["data"][0]["data"]["object"];
+    assert_eq!(created["id"], subscription_id);
+    assert_eq!(created["latest_invoice"], latest_invoice);
+
+    let expanded: Value = server
+        .client
+        .get(server.url(&format!(
+            "/v1/subscriptions/{subscription_id}?expand[]=latest_invoice"
+        )))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(expanded["latest_invoice"]["object"], "invoice");
+    assert_eq!(expanded["latest_invoice"]["id"], latest_invoice);
+    assert!(
+        expanded["latest_invoice"]["hosted_invoice_url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/mock/invoices/{latest_invoice}"))
+    );
+}
+
+#[tokio::test]
+async fn cancel_at_period_end_tracks_cancel_at_and_cancellation_stamps() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "cancel@example.com").await;
+    let product = create_product(&server, &key, "Monthly").await;
+    let price: Value = server
+        .client
+        .post(server.url("/v1/prices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("product", product.as_str()),
+            ("currency", "usd"),
+            ("recurring[interval]", "month"),
+            ("unit_amount", "1000"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let subscription: Value = server
+        .client
+        .post(server.url("/v1/subscriptions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("items[0][price]", price["id"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = subscription["id"].as_str().unwrap().to_string();
+    let period_end = subscription["current_period_end"].as_i64().unwrap();
+
+    let scheduled: Value = server
+        .client
+        .post(server.url(&format!("/v1/subscriptions/{id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[("cancel_at_period_end", "true")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(scheduled["cancel_at_period_end"], true);
+    assert_eq!(scheduled["cancel_at"].as_i64(), Some(period_end));
+
+    let cleared: Value = server
+        .client
+        .post(server.url(&format!("/v1/subscriptions/{id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[("cancel_at_period_end", "false")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cleared["cancel_at_period_end"], false);
+    assert_eq!(cleared["cancel_at"], Value::Null);
+
+    let deleted: Value = server
+        .client
+        .delete(server.url(&format!("/v1/subscriptions/{id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(deleted["status"], "canceled");
+    assert!(deleted["canceled_at"].as_i64().is_some());
+    assert!(deleted["ended_at"].as_i64().is_some());
+}
+
+#[tokio::test]
+async fn advance_cancels_a_subscription_at_the_period_end() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "advance-cancel@example.com").await;
+    let product = create_product(&server, &key, "Monthly").await;
+    let price: Value = server
+        .client
+        .post(server.url("/v1/prices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("product", product.as_str()),
+            ("currency", "usd"),
+            ("recurring[interval]", "month"),
+            ("unit_amount", "1000"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let subscription: Value = server
+        .client
+        .post(server.url("/v1/subscriptions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("items[0][price]", price["id"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = subscription["id"].as_str().unwrap().to_string();
+    let period_end = subscription["current_period_end"].as_i64().unwrap();
+
+    let scheduled: Value = server
+        .client
+        .post(server.url(&format!("/v1/subscriptions/{id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[("cancel_at_period_end", "true")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(scheduled["cancel_at"], period_end);
+
+    let advanced: Value = server
+        .client
+        .post(server.url(&format!("/internal/subscriptions/{id}/advance")))
+        .json(&json!({ "outcome": "paid" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(advanced["subscription"]["status"], "canceled");
+    assert_eq!(advanced["subscription"]["canceled_at"], period_end);
+    assert_eq!(advanced["subscription"]["ended_at"], period_end);
+    assert_eq!(advanced["invoice"], Value::Null);
+
+    // No renewal invoice exists for the canceled period.
+    let invoices: Value = server
+        .client
+        .get(server.url(&format!("/v1/invoices?subscription={id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let invoices_data = invoices["data"].as_array().unwrap();
+    assert_eq!(invoices_data.len(), 1);
+    assert_eq!(invoices_data[0]["billing_reason"], "subscription_create");
+
+    let events: Value = server
+        .client
+        .get(server.url("/v1/events?type=customer.subscription.deleted"))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let deleted = &events["data"][0]["data"]["object"];
+    assert_eq!(deleted["id"], id);
+    assert_eq!(deleted["status"], "canceled");
+}
+
+#[tokio::test]
+async fn billing_cycle_anchor_day_is_echoed_and_validated() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "anchor@example.com").await;
+    let product = create_product(&server, &key, "Monthly").await;
+    let price: Value = server
+        .client
+        .post(server.url("/v1/prices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("product", product.as_str()),
+            ("currency", "usd"),
+            ("recurring[interval]", "month"),
+            ("unit_amount", "1000"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let subscription: Value = server
+        .client
+        .post(server.url("/v1/subscriptions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("items[0][price]", price["id"].as_str().unwrap()),
+            ("billing_cycle_anchor_config[day_of_month]", "15"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        subscription["billing_cycle_anchor_config"]["day_of_month"],
+        15
+    );
+    let id = subscription["id"].as_str().unwrap().to_string();
+    let retrieved: Value = server
+        .client
+        .get(server.url(&format!("/v1/subscriptions/{id}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retrieved["billing_cycle_anchor_config"]["day_of_month"], 15);
+
+    let rejected: Value = server
+        .client
+        .post(server.url("/v1/subscriptions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("items[0][price]", price["id"].as_str().unwrap()),
+            ("billing_cycle_anchor_config[day_of_month]", "32"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rejected["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        rejected["error"]["param"],
+        "billing_cycle_anchor_config[day_of_month]"
+    );
+
+    let list: Value = server
+        .client
+        .get(server.url(&format!("/v1/subscriptions?customer={customer}")))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        list["data"].as_array().unwrap().len(),
+        1,
+        "the invalid anchor created no subscription"
+    );
+}
+
+#[tokio::test]
+async fn subscription_invoices_and_previews_report_parent_and_taxes() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let customer = create_customer(&server, &key, "parent@example.com").await;
+    let product = create_product(&server, &key, "Monthly").await;
+    let price: Value = server
+        .client
+        .post(server.url("/v1/prices"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("product", product.as_str()),
+            ("currency", "usd"),
+            ("recurring[interval]", "month"),
+            ("unit_amount", "4900"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let price_id = price["id"].as_str().unwrap().to_string();
+    let subscription: Value = server
+        .client
+        .post(server.url("/v1/subscriptions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("items[0][price]", price_id.as_str()),
+            ("metadata[plan]", "team"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let subscription_id = subscription["id"].as_str().unwrap().to_string();
+
+    let invoice: Value = server
+        .client
+        .get(server.url(&format!(
+            "/v1/invoices/{}",
+            subscription["latest_invoice"].as_str().unwrap()
+        )))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(invoice["parent"]["type"], "subscription_details");
+    assert_eq!(
+        invoice["parent"]["subscription_details"]["subscription"],
+        subscription_id
+    );
+    assert_eq!(
+        invoice["parent"]["subscription_details"]["metadata"]["plan"],
+        "team"
+    );
+    assert_eq!(invoice["total_taxes"], json!([]));
+    // The legacy fields remain alongside the newer shape.
+    assert_eq!(invoice["subscription"], subscription_id);
+    let line = &invoice["lines"]["data"][0];
+    assert_eq!(
+        line["subscription_item"],
+        subscription["items"]["data"][0]["id"]
+    );
+    assert_eq!(line["pricing"]["unit_amount_decimal"], "4900");
+
+    let preview: Value = server
+        .client
+        .post(server.url("/v1/invoices/create_preview"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("customer", customer.as_str()),
+            ("subscription", subscription_id.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(preview["parent"]["type"], "subscription_details");
+    assert_eq!(
+        preview["parent"]["subscription_details"]["subscription"],
+        subscription_id
+    );
+    assert_eq!(
+        preview["parent"]["subscription_details"]["metadata"]["plan"],
+        "team"
+    );
+    assert_eq!(preview["total_taxes"], json!([]));
+    let preview_line = &preview["lines"]["data"][0];
+    assert_eq!(
+        preview_line["parent"]["subscription_item_details"]["subscription"],
+        subscription_id
+    );
+    assert_eq!(preview_line["pricing"]["price_details"]["price"], price_id);
+}
+
+#[tokio::test]
+async fn internal_meter_events_list_and_filter_accepted_events() {
+    let server = spawn().await;
+    let key = main_secret(&server).await;
+    let meter = create_meter(&server, &key).await;
+    let customer = create_customer(&server, &key, "inspect@example.com").await;
+    assert!(!meter.is_empty());
+
+    let documents: Value = server
+        .client
+        .post(server.url("/v1/billing/meters"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("display_name", "Documents"),
+            ("event_name", "documents.used"),
+            ("default_aggregation[formula]", "sum"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(documents["object"], "billing.meter");
+
+    assert!(
+        report_usage(&server, &key, &customer, "inspect-1", 10)
+            .await
+            .status()
+            .is_success()
+    );
+    assert!(
+        report_usage(&server, &key, &customer, "inspect-2", 5)
+            .await
+            .status()
+            .is_success()
+    );
+    let document_event = server
+        .client
+        .post(server.url("/v1/billing/meter_events"))
+        .header("Authorization", format!("Bearer {key}"))
+        .form(&[
+            ("event_name", "documents.used"),
+            ("identifier", "documents-1"),
+            ("payload[stripe_customer_id]", customer.as_str()),
+            ("payload[value]", "3"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(document_event.status().is_success());
+
+    // The unfiltered list carries every accepted event; no Authorization header
+    // is needed on the control plane.
+    let all: Value = server
+        .client
+        .get(server.url("/internal/meter_events"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(all["object"], "list");
+    assert_eq!(all["data"].as_array().unwrap().len(), 3);
+    let api_call = all["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["identifier"] == "inspect-1")
+        .unwrap();
+    assert_eq!(api_call["event_name"], "api_call");
+    assert_eq!(api_call["customer"], customer);
+    assert_eq!(api_call["value"], "10");
+    assert!(api_call["timestamp"].as_i64().is_some());
+
+    let filtered: Value = server
+        .client
+        .get(server.url(&format!(
+            "/internal/meter_events?event_name=api_call&customer={customer}"
+        )))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let filtered_data = filtered["data"].as_array().unwrap();
+    assert_eq!(filtered_data.len(), 2);
+    assert!(
+        filtered_data
+            .iter()
+            .all(|event| event["event_name"] == "api_call")
+    );
+
+    let documents_only: Value = server
+        .client
+        .get(server.url("/internal/meter_events?event_name=documents.used"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let documents_data = documents_only["data"].as_array().unwrap();
+    assert_eq!(documents_data.len(), 1);
+    assert_eq!(documents_data[0]["identifier"], "documents-1");
+    assert_eq!(documents_data[0]["value"], "3");
 }
 
 #[tokio::test]

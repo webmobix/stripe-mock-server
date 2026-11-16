@@ -83,6 +83,24 @@ with HTTP 400 and Stripe's error code:
 The event must name an **active** meter. An unknown `event_name` is rejected with
 the code `no_meter`.
 
+## Inspect accepted events
+
+`GET /internal/meter_events` is a control-plane endpoint (no Stripe
+authentication) that returns the accepted raw events in a v1 list envelope.
+Filter by `event_name` and by the mapped customer id with `customer`:
+
+```bash
+# Every accepted event.
+curl -s "$BASE/internal/meter_events"
+
+# One event name for one customer.
+curl -s "$BASE/internal/meter_events?event_name=api_call&customer=$CID"
+```
+
+Each item carries `identifier`, `event_name`, the mapped `customer`, the
+reported `value` as a string, and `timestamp`. See
+[`internal.md`](internal.md#inspect-meter-events).
+
 ## Event summaries
 
 ```bash
