@@ -63,7 +63,9 @@ curl -s -X POST $BASE/v1/billing/meter_events \
 
 The response is a `billing.meter_event` with `event_name`, `identifier`,
 `timestamp`, and the string-valued `payload`. `timestamp` defaults to now and
-must fall within the past 35 days or five minutes into the future.
+must fall within the past 35 days or five minutes into the future. For a
+customer attached to a [test clock](test-clocks.md), `timestamp` defaults to
+the clock's `frozen_time` and is validated against it instead.
 
 `identifier` makes reporting safe to retry. A duplicate identifier is rejected
 with HTTP 400 and Stripe's error code:

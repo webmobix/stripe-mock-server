@@ -268,6 +268,9 @@ Beyond the quickstart, the v1 API also supports:
 - subscription first and renewal invoices, plus
   `POST /internal/subscriptions/{id}/advance` for paid/failed renewal and
   recovery — see [`docs/billing.md`](docs/billing.md);
+- test clocks at `/v1/test_helpers/test_clocks` with frozen customers,
+  clock-wide renewal, metered arrears, and cancel-at-period-end — see
+  [`docs/test-clocks.md`](docs/test-clocks.md);
 - `POST /v1/invoices/create_preview` for the upcoming invoice — see
   [`docs/invoicing.md`](docs/invoicing.md);
 - `Idempotency-Key` replay on v1 mutations — see
@@ -362,6 +365,7 @@ Hub may create it on first push when the token has permission).
 - [`docs/catalog.md`](docs/catalog.md) — products, prices, lookup keys, metered/tiered prices, and product expansion.
 - [`docs/meters.md`](docs/meters.md) — billing meters, meter events, event summaries, and usage pricing.
 - [`docs/billing.md`](docs/billing.md) — customers, subscriptions, updates, prorations, first/renewal invoices, billing-period advance, and billing portal sessions.
+- [`docs/test-clocks.md`](docs/test-clocks.md) — test clocks, frozen time, clock-wide renewal, and clock-scoped deletion.
 - [`docs/coupons.md`](docs/coupons.md) — coupons, their validation rules, and redemption.
 - [`docs/tax-rates.md`](docs/tax-rates.md) — tax rates and their filters.
 - [`docs/invoicing.md`](docs/invoicing.md) — invoices, invoice lifecycle, upcoming invoice preview, and payment intents.

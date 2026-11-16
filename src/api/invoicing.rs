@@ -2109,6 +2109,7 @@ mod tests {
             tax_ids: None,
             metadata: None,
             invoice_settings: None,
+            test_clock: None,
         }
     }
 

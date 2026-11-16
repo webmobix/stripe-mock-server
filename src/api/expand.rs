@@ -14,6 +14,7 @@ use sqlx::SqlitePool;
 
 use crate::models::{
     CustomerRow, PaymentIntentRow, PaymentMethodRow, PriceRow, ProductRow, SubscriptionRow,
+    TestClockRow,
 };
 
 /// Expand every path in `paths` over `value`, returning the modified value.
@@ -143,6 +144,16 @@ async fn resolve(pool: &SqlitePool, account_id: &str, field: &str, value: &Value
         "payment_method" | "default_payment_method" if id.starts_with("pm_") => {
             let row: PaymentMethodRow =
                 sqlx::query_as("SELECT * FROM payment_methods WHERE id = ?1 AND account_id = ?2")
+                    .bind(id)
+                    .bind(account_id)
+                    .fetch_optional(pool)
+                    .await
+                    .ok()??;
+            Some(row.to_json())
+        }
+        "test_clock" if id.starts_with("clock_") => {
+            let row: TestClockRow =
+                sqlx::query_as("SELECT * FROM test_clocks WHERE id = ?1 AND account_id = ?2")
                     .bind(id)
                     .bind(account_id)
                     .fetch_optional(pool)
@@ -297,6 +308,31 @@ mod tests {
         let mut value = json!({ "product": "prod_other" });
         value = expand_response(&pool, "acct_1", value, &["product".into()]).await;
         assert_eq!(value["product"], "prod_other");
+    }
+
+    #[tokio::test]
+    async fn expands_a_test_clock_scoped_to_the_account() {
+        let pool = pool().await;
+        for (account, id) in [("acct_1", "clock_mine"), ("acct_2", "clock_other")] {
+            sqlx::query(
+                "INSERT INTO test_clocks (id, account_id, name, frozen_time, status, created, deletes_after) \
+                 VALUES (?1, ?2, NULL, 0, 'ready', 0, 0)",
+            )
+            .bind(id)
+            .bind(account)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mut value = json!({ "test_clock": "clock_mine" });
+        value = expand_response(&pool, "acct_1", value, &["test_clock".into()]).await;
+        assert_eq!(value["test_clock"]["id"], "clock_mine");
+        assert_eq!(value["test_clock"]["object"], "test_helpers.test_clock");
+        assert_eq!(value["test_clock"]["frozen_time"], 0);
+
+        let mut other = json!({ "test_clock": "clock_other" });
+        other = expand_response(&pool, "acct_1", other, &["test_clock".into()]).await;
+        assert_eq!(other["test_clock"], "clock_other");
     }
 
     #[tokio::test]

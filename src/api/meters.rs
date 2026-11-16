@@ -349,13 +349,29 @@ pub async fn create_meter_event(
             )
         })?;
 
+    // A meter event for a customer on a test clock belongs to the clock's
+    // simulated timeline: its usage timestamp defaults to the frozen time and
+    // is validated against it, so usage lands inside the frozen billing period.
+    let clock_time: Option<i64> = sqlx::query_scalar(
+        "SELECT tc.frozen_time FROM customers c
+         JOIN test_clocks tc ON tc.id = c.test_clock AND tc.account_id = c.account_id
+         WHERE c.id = ?1 AND c.account_id = ?2",
+    )
+    .bind(&customer)
+    .bind(&ctx.account_id)
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
     let now = time::now_epoch();
-    let timestamp = get_i64(&params, &["timestamp"]).unwrap_or(now);
-    if timestamp < now - 35 * 86_400 || timestamp > now + 300 {
-        return Err(invalid(
-            "timestamp",
-            "timestamp must be within the past 35 days or up to 5 minutes in the future",
-        ));
+    let reference = clock_time.unwrap_or(now);
+    let timestamp = get_i64(&params, &["timestamp"]).unwrap_or(reference);
+    if timestamp < reference - 35 * 86_400 || timestamp > reference + 300 {
+        let message = if clock_time.is_some() {
+            "timestamp must be within 35 days before the test clock's frozen time or up to 5 minutes after it"
+        } else {
+            "timestamp must be within the past 35 days or up to 5 minutes in the future"
+        };
+        return Err(invalid("timestamp", message));
     }
     let identifier = get_str(&params, &["identifier"]).unwrap_or_else(ids::meter_event_identifier);
     let duplicate: Option<String> =

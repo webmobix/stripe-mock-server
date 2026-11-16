@@ -739,20 +739,48 @@ pub async fn create_customer(
     let params = form::parse_form(&body);
     let id = ids::customer_id();
     let now = time::now_epoch();
-    let tax_ids = parse_tax_id_data(&params, now)?;
+    // A customer created on a clock is stamped with its frozen time.
+    let test_clock = get_str(&params, &["test_clock"]);
+    let mut created = now;
+    if let Some(clock_id) = &test_clock {
+        let clock: Option<TestClockRow> =
+            sqlx::query_as("SELECT * FROM test_clocks WHERE id = ?1 AND account_id = ?2")
+                .bind(clock_id)
+                .bind(&ctx.account_id)
+                .fetch_optional(&st.pool)
+                .await
+                .map_err(ApiError::internal)?;
+        let clock = clock.ok_or_else(|| {
+            ApiError::invalid_param(
+                v1(),
+                "test_clock",
+                format!("No such test clock: {clock_id}"),
+            )
+        })?;
+        if clock.status != "ready" {
+            return Err(ApiError::invalid_param(
+                v1(),
+                "test_clock",
+                "The test clock is not ready",
+            ));
+        }
+        created = clock.frozen_time;
+    }
+    let tax_ids = parse_tax_id_data(&params, created)?;
     let currency = parse_currency(&params)?;
 
     let event_id = {
         let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
-        sqlx::query("INSERT INTO customers (id, account_id, email, name, currency, created, tax_ids, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
+        sqlx::query("INSERT INTO customers (id, account_id, email, name, currency, created, tax_ids, metadata, test_clock) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")
             .bind(&id)
             .bind(&ctx.account_id)
             .bind(get_str(&params, &["email"]))
             .bind(get_str(&params, &["name"]))
             .bind(&currency)
-            .bind(now)
+            .bind(created)
             .bind(serde_json::to_string(&tax_ids).unwrap_or_else(|_| "[]".to_string()))
             .bind(metadata_from(&params).to_string())
+            .bind(&test_clock)
             .execute(&mut *tx)
             .await
             .map_err(ApiError::internal)?;
@@ -761,12 +789,13 @@ pub async fn create_customer(
             .fetch_one(&mut *tx)
             .await
             .map_err(ApiError::internal)?;
-        let event_id = events::emit(
+        let event_id = events::emit_at(
             &mut tx,
             &ctx.account_id,
             ctx.is_connected,
             "customer.created",
             customer.to_json(),
+            created,
         )
         .await
         .map_err(ApiError::internal)?;
@@ -1032,13 +1061,14 @@ fn build_subscription_item(
     price: &PriceRow,
     quantity: Option<i64>,
     subscription_id: &str,
+    created: i64,
     period_start: i64,
     period_end: i64,
 ) -> Value {
     json!({
         "id": ids::id("si_"),
         "object": "subscription_item",
-        "created": time::now_epoch(),
+        "created": created,
         "current_period_start": period_start,
         "current_period_end": period_end,
         "price": price.to_json(),
@@ -1068,13 +1098,43 @@ pub async fn create_subscription(
         return Err(ApiError::missing_param(v1(), "items"));
     }
     let id = ids::subscription_id();
-    let now = time::now_epoch();
-    let period_end = now + 30 * 86_400;
-    let mut built_items = Vec::new();
+    // A subscription for a clock customer inherits the clock and runs on its
+    // frozen time; every other subscription keeps wall-clock time.
+    let mut clock: Option<TestClockRow> = None;
+    if let Some(customer_id) = &customer {
+        let customer_row: Option<CustomerRow> =
+            sqlx::query_as("SELECT * FROM customers WHERE id = ?1 AND account_id = ?2")
+                .bind(customer_id)
+                .bind(&ctx.account_id)
+                .fetch_optional(&st.pool)
+                .await
+                .map_err(ApiError::internal)?;
+        if let Some(clock_id) = customer_row.as_ref().and_then(|c| c.test_clock.clone()) {
+            clock = sqlx::query_as("SELECT * FROM test_clocks WHERE id = ?1 AND account_id = ?2")
+                .bind(&clock_id)
+                .bind(&ctx.account_id)
+                .fetch_optional(&st.pool)
+                .await
+                .map_err(ApiError::internal)?;
+        }
+    }
+    let now = clock
+        .as_ref()
+        .map(|clock| clock.frozen_time)
+        .unwrap_or_else(time::now_epoch);
+    let test_clock = clock.as_ref().map(|clock| clock.id.clone());
+    let mut loaded_items: Vec<(PriceRow, Option<i64>)> = Vec::new();
+    let mut first_interval: Option<(String, i64)> = None;
     for item in &items {
         let price_id = get_str(item, &["price"])
             .ok_or_else(|| ApiError::missing_param(v1(), "items[][price]"))?;
         let price = load_price(&st, &ctx.account_id, &price_id, "items[0][price]").await?;
+        if first_interval.is_none() {
+            first_interval = price
+                .recurring_interval
+                .clone()
+                .map(|interval| (interval, price.recurring_interval_count.unwrap_or(1).max(1)));
+        }
         let quantity = if price.is_metered() {
             if get_str(item, &["quantity"]).is_some() {
                 return Err(ApiError::invalid_param(
@@ -1087,17 +1147,29 @@ pub async fn create_subscription(
         } else {
             Some(parse_quantity(item)?)
         };
-        built_items.push(build_subscription_item(
-            &price, quantity, &id, now, period_end,
-        ));
+        loaded_items.push((price, quantity));
     }
+    // The clock's first period follows the price interval; the shared 30-day
+    // default stays in place for non-clock subscriptions.
+    let period_end = if clock.is_some() {
+        let (interval, count) = first_interval.unwrap_or_else(|| ("month".to_string(), 1));
+        crate::api::billing::advance_period(now, &interval, count)
+    } else {
+        now + 30 * 86_400
+    };
+    let built_items: Vec<Value> = loaded_items
+        .iter()
+        .map(|(price, quantity)| {
+            build_subscription_item(price, *quantity, &id, now, now, period_end)
+        })
+        .collect();
 
     let event_ids = {
         let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
         sqlx::query(
             "INSERT INTO subscriptions (id, account_id, customer, customer_account, status, created, current_period_start,
-                current_period_end, cancel_at_period_end, items, metadata)
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, ?6, 0, ?7, ?8)",
+                current_period_end, cancel_at_period_end, items, metadata, test_clock)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, ?6, 0, ?7, ?8, ?9)",
         )
         .bind(&id)
         .bind(&ctx.account_id)
@@ -1107,6 +1179,7 @@ pub async fn create_subscription(
         .bind(period_end)
         .bind(serde_json::to_string(&built_items).unwrap())
         .bind(metadata_from(&params).to_string())
+        .bind(&test_clock)
         .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
@@ -1118,12 +1191,13 @@ pub async fn create_subscription(
                 .await
                 .map_err(ApiError::internal)?;
         let mut event_ids = vec![
-            events::emit(
+            events::emit_at(
                 &mut tx,
                 &ctx.account_id,
                 ctx.is_connected,
                 "customer.subscription.created",
                 subscription.to_json(),
+                now,
             )
             .await
             .map_err(ApiError::internal)?,
@@ -1139,6 +1213,7 @@ pub async fn create_subscription(
             period_end,
             "subscription_create",
             true,
+            now,
             &st.config.base_url(),
         )
         .await?;
@@ -2195,9 +2270,35 @@ pub async fn complete_checkout_session(
         }
 
         if let Some(sub_id) = &subscription_id_value {
-            let now = time::now_epoch();
-            let period_end = now + 30 * 86_400;
-            let mut items = Vec::new();
+            // A clock customer's checkout subscription inherits the clock; the
+            // session itself stays wall-clock time.
+            let mut clock: Option<TestClockRow> = None;
+            if let Some(customer) = &session.customer {
+                let customer_row: Option<CustomerRow> =
+                    sqlx::query_as("SELECT * FROM customers WHERE id = ?1 AND account_id = ?2")
+                        .bind(customer)
+                        .bind(&account_id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(ApiError::internal)?;
+                if let Some(clock_id) = customer_row.as_ref().and_then(|c| c.test_clock.clone()) {
+                    clock = sqlx::query_as(
+                        "SELECT * FROM test_clocks WHERE id = ?1 AND account_id = ?2",
+                    )
+                    .bind(&clock_id)
+                    .bind(&account_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(ApiError::internal)?;
+                }
+            }
+            let now = clock
+                .as_ref()
+                .map(|clock| clock.frozen_time)
+                .unwrap_or_else(time::now_epoch);
+            let test_clock = clock.as_ref().map(|clock| clock.id.clone());
+            let mut loaded_prices: Vec<(PriceRow, Option<i64>)> = Vec::new();
+            let mut first_interval: Option<(String, i64)> = None;
             for item in session.line_items() {
                 let price_id = get_str(&item, &["price", "id"]);
                 if let Some(price_id) = price_id {
@@ -2209,6 +2310,11 @@ pub async fn complete_checkout_session(
                             .await
                             .map_err(ApiError::internal)?;
                     if let Some(price) = price {
+                        if first_interval.is_none() {
+                            first_interval = price.recurring_interval.clone().map(|interval| {
+                                (interval, price.recurring_interval_count.unwrap_or(1).max(1))
+                            });
+                        }
                         let quantity = if price.is_metered() {
                             None
                         } else {
@@ -2218,16 +2324,26 @@ pub async fn complete_checkout_session(
                                     .unwrap_or(1),
                             )
                         };
-                        items.push(build_subscription_item(
-                            &price, quantity, sub_id, now, period_end,
-                        ));
+                        loaded_prices.push((price, quantity));
                     }
                 }
             }
+            let period_end = if clock.is_some() {
+                let (interval, count) = first_interval.unwrap_or_else(|| ("month".to_string(), 1));
+                crate::api::billing::advance_period(now, &interval, count)
+            } else {
+                now + 30 * 86_400
+            };
+            let items: Vec<Value> = loaded_prices
+                .iter()
+                .map(|(price, quantity)| {
+                    build_subscription_item(price, *quantity, sub_id, now, now, period_end)
+                })
+                .collect();
             sqlx::query(
                 "INSERT INTO subscriptions (id, account_id, customer, customer_account, status, created, current_period_start,
-                    current_period_end, cancel_at_period_end, items, metadata)
-                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, ?6, 0, ?7, ?8)",
+                    current_period_end, cancel_at_period_end, items, metadata, test_clock)
+                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, ?6, 0, ?7, ?8, ?9)",
             )
             .bind(sub_id)
             .bind(&account_id)
@@ -2237,6 +2353,7 @@ pub async fn complete_checkout_session(
             .bind(period_end)
             .bind(serde_json::to_string(&items).unwrap())
             .bind(session.subscription_metadata().to_string())
+            .bind(&test_clock)
             .execute(&mut *tx)
             .await
             .map_err(ApiError::internal)?;
@@ -2247,12 +2364,13 @@ pub async fn complete_checkout_session(
                     .await
                     .map_err(ApiError::internal)?;
             event_ids.push(
-                events::emit(
+                events::emit_at(
                     &mut tx,
                     &account_id,
                     is_connected,
                     "customer.subscription.created",
                     subscription.to_json(),
+                    now,
                 )
                 .await
                 .map_err(ApiError::internal)?,
@@ -2268,6 +2386,7 @@ pub async fn complete_checkout_session(
                 period_end,
                 "subscription_create",
                 true,
+                now,
                 &st.config.base_url(),
             )
             .await?;

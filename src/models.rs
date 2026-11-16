@@ -312,6 +312,44 @@ impl PriceRow {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TestClockRow {
+    pub id: String,
+    pub account_id: String,
+    pub name: Option<String>,
+    pub frozen_time: i64,
+    pub status: String,
+    pub created: i64,
+    pub deletes_after: i64,
+}
+
+impl TestClockRow {
+    pub fn to_json(&self) -> Value {
+        self.render(&self.status, Value::Null)
+    }
+
+    /// Render the clock with an explicit status and `status_details.advancing`.
+    ///
+    /// The advance endpoint answers `advancing` before its committed `ready`
+    /// state, so the same row renders both.
+    pub fn render(&self, status: &str, advancing: Value) -> Value {
+        json!({
+            "id": self.id,
+            "object": "test_helpers.test_clock",
+            "created": self.created,
+            "deletes_after": self.deletes_after,
+            "frozen_time": self.frozen_time,
+            "livemode": false,
+            "name": self.name,
+            "status": status,
+            "status_details": {
+                "advancing": advancing,
+                "internal_failure": Value::Null,
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CustomerRow {
     pub id: String,
     pub account_id: String,
@@ -322,6 +360,7 @@ pub struct CustomerRow {
     pub tax_ids: Option<String>,
     pub metadata: Option<String>,
     pub invoice_settings: Option<String>,
+    pub test_clock: Option<String>,
 }
 
 impl CustomerRow {
@@ -351,6 +390,7 @@ impl CustomerRow {
             "metadata": parse_json_or_empty(&self.metadata),
             "name": self.name,
             "tax_ids": parse_json_or_empty(&self.tax_ids),
+            "test_clock": self.test_clock,
         })
     }
 
@@ -587,6 +627,7 @@ pub struct SubscriptionRow {
     pub cancel_at_period_end: i64,
     pub items: String,
     pub metadata: Option<String>,
+    pub test_clock: Option<String>,
 }
 
 impl SubscriptionRow {
@@ -625,6 +666,7 @@ impl SubscriptionRow {
             "livemode": false,
             "metadata": parse_json_or_empty(&self.metadata),
             "status": self.status,
+            "test_clock": self.test_clock,
             "items": {
                 "object": "list",
                 "data": items,
@@ -839,6 +881,7 @@ pub struct InvoiceRow {
     pub collection_method: String,
     pub attempt_count: i64,
     pub payment_intent: Option<String>,
+    pub test_clock: Option<String>,
 }
 
 impl InvoiceRow {
@@ -894,6 +937,7 @@ impl InvoiceRow {
             "subscription": self.subscription,
             "subtotal": self.subtotal,
             "tax_total": self.tax_total,
+            "test_clock": self.test_clock,
             "total": self.total,
             "updated": self.updated,
             "voided_at": self.voided_at,
@@ -1273,6 +1317,7 @@ mod tests {
             tax_ids: Some(tax_ids.into()),
             metadata: Some("{}".into()),
             invoice_settings: None,
+            test_clock: None,
         }
     }
 
@@ -1469,7 +1514,46 @@ mod tests {
             collection_method: "send_invoice".into(),
             attempt_count: 0,
             payment_intent: None,
+            test_clock: None,
         }
+    }
+
+    #[test]
+    fn scoped_objects_render_the_test_clock() {
+        let mut customer = customer("[]");
+        assert_eq!(customer.to_json()["test_clock"], Value::Null);
+        customer.test_clock = Some("clock_1".into());
+        assert_eq!(customer.to_json()["test_clock"], "clock_1");
+
+        let mut invoice = invoice(1000, 1000, "paid");
+        assert_eq!(invoice.to_json(BASE_URL)["test_clock"], Value::Null);
+        invoice.test_clock = Some("clock_1".into());
+        assert_eq!(invoice.to_json(BASE_URL)["test_clock"], "clock_1");
+    }
+
+    #[test]
+    fn test_clock_renders_status_details() {
+        let row = TestClockRow {
+            id: "clock_1".into(),
+            account_id: "acct_1".into(),
+            name: Some("Annual renewal".into()),
+            frozen_time: 1_577_836_800,
+            status: "ready".into(),
+            created: 10,
+            deletes_after: 30,
+        };
+        let json = row.to_json();
+        assert_eq!(json["object"], "test_helpers.test_clock");
+        assert_eq!(json["frozen_time"], 1_577_836_800);
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["status_details"]["advancing"], Value::Null);
+
+        let advancing = row.render("advancing", json!({"target_frozen_time": 1_580_428_800}));
+        assert_eq!(advancing["status"], "advancing");
+        assert_eq!(
+            advancing["status_details"]["advancing"]["target_frozen_time"],
+            1_580_428_800
+        );
     }
 
     #[test]
@@ -1567,6 +1651,7 @@ mod tests {
             cancel_at_period_end: 0,
             items: serde_json::to_string(&json!([new_item])).unwrap(),
             metadata: Some("{}".into()),
+            test_clock: None,
         };
         let json = row.to_json();
         let item = &json["items"]["data"][0];

@@ -18,6 +18,7 @@ pub const PAYLOAD_THIN: &str = "thin";
 
 /// Insert an event row and one pending delivery per destination chosen by
 /// `select`, all in the caller's transaction.
+#[allow(clippy::too_many_arguments)]
 async fn insert_event(
     tx: &mut Transaction<'_, Sqlite>,
     id: String,
@@ -26,9 +27,9 @@ async fn insert_event(
     event_type: &str,
     version: &str,
     data: &Value,
+    created: i64,
     select: impl Fn(&EventDestinationRow) -> bool,
 ) -> Result<String, sqlx::Error> {
-    let created = time::now_epoch();
     let data = serde_json::to_string(data).unwrap_or_else(|_| "null".to_string());
 
     sqlx::query(
@@ -76,6 +77,27 @@ pub async fn emit(
     event_type: &str,
     data_object: Value,
 ) -> Result<String, sqlx::Error> {
+    emit_at(
+        tx,
+        account_id,
+        is_connected,
+        event_type,
+        data_object,
+        time::now_epoch(),
+    )
+    .await
+}
+
+/// Like [`emit`], but stamps the event (and its deliveries) with an explicit
+/// `created` so clock-scoped paths can emit at simulated time.
+pub async fn emit_at(
+    tx: &mut Transaction<'_, Sqlite>,
+    account_id: &str,
+    is_connected: bool,
+    event_type: &str,
+    data_object: Value,
+    created: i64,
+) -> Result<String, sqlx::Error> {
     let event_account = is_connected.then_some(account_id);
     insert_event(
         tx,
@@ -85,6 +107,7 @@ pub async fn emit(
         event_type,
         EVENT_VERSION,
         &data_object,
+        created,
         |d| destination_matches(d, account_id, event_account, PAYLOAD_SNAPSHOT, event_type),
     )
     .await
@@ -211,6 +234,7 @@ pub async fn emit_thin(
         event_type,
         EVENT_VERSION_V2,
         &envelope,
+        time::now_epoch(),
         |d| match only_destination {
             Some(only) => d.id == only && d.event_payload == PAYLOAD_THIN,
             None => {

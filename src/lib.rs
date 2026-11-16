@@ -253,6 +253,19 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/events", get(api::v1::list_events))
         .route("/v1/events/{id}", get(api::v1::get_event))
+        // Test helpers: test clocks
+        .route(
+            "/v1/test_helpers/test_clocks",
+            post(api::test_clocks::create_test_clock).get(api::test_clocks::list_test_clocks),
+        )
+        .route(
+            "/v1/test_helpers/test_clocks/{id}",
+            get(api::test_clocks::get_test_clock).delete(api::test_clocks::delete_test_clock),
+        )
+        .route(
+            "/v1/test_helpers/test_clocks/{id}/advance",
+            post(api::test_clocks::advance_test_clock),
+        )
         // v2 core API
         .route(
             "/v2/core/accounts",

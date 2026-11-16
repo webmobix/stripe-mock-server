@@ -108,7 +108,9 @@ period, raises a `subscription_cycle` invoice, and sets the subscription
 `active` or `past_due`. With an open invoice it retries that invoice instead, so
 `failed` followed by `paid` models failure and recovery. The response carries
 the updated `subscription` and the `invoice`. See
-[`billing.md`](billing.md#end-a-billing-period).
+[`billing.md`](billing.md#end-a-billing-period). For a clock-wide advance that
+renews every subscription attached to a [test clock](test-clocks.md), use
+`POST /v1/test_helpers/test_clocks/{id}/advance`.
 
 ## Reset
 
@@ -118,6 +120,7 @@ curl -s -X POST $BASE/internal/reset
 ```
 
 Clears all objects, events, deliveries, idempotency keys, and saved payment
-methods, then reapplies configuration seeding. Configured `[main_account]` keys
+methods — including [test clocks](test-clocks.md) and their associations — then
+reapplies configuration seeding. Configured `[main_account]` keys
 and `webhook_endpoint.signing_secret` values survive; otherwise the main account
 gets fresh keys. Call `/internal/main` again after a reset to read them.

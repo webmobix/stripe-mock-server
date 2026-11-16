@@ -150,6 +150,10 @@ curl -s -X POST "$BASE/internal/subscriptions/$SID/advance" \
   -H 'Content-Type: application/json' -d '{"outcome":"paid"}'
 ```
 
+To freeze a customer's time and drive every attached subscription at once, use
+a [test clock](test-clocks.md) and advance it instead of advancing each
+subscription.
+
 ## Update a subscription
 
 `POST /v1/subscriptions/{id}` changes item quantities by item id. The current

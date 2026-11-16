@@ -8,7 +8,6 @@ use crate::error::ApiError;
 use crate::events;
 use crate::ids;
 use crate::models::{InvoiceRow, SubscriptionRow, parse_json, usage_number};
-use crate::time;
 
 /// Round to the nearest minor unit, halves away from zero.
 fn round_money(raw: f64) -> i64 {
@@ -272,6 +271,7 @@ pub async fn raise_subscription_invoice(
     metered_end: i64,
     billing_reason: &str,
     paid: bool,
+    created_at: i64,
     base_url: &str,
 ) -> Result<(InvoiceRow, Vec<String>), ApiError> {
     let conn = &mut *tx;
@@ -303,17 +303,17 @@ pub async fn raise_subscription_invoice(
         .to_string();
     let customer = subscription.customer.clone().unwrap_or_default();
     let id = ids::invoice_id();
-    let now = time::now_epoch();
+    let now = created_at;
 
     sqlx::query(
         "INSERT INTO invoices (id, account_id, customer, status, currency, created, updated,
             finalized_at, paid_at, voided_at, due_date, amount_due, amount_paid, amount_remaining,
             subtotal, tax_total, total, lines, customer_tax_ids, description, metadata,
             subscription, billing_reason, period_start, period_end, collection_method,
-            attempt_count, payment_intent)
+            attempt_count, payment_intent, test_clock)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6, ?7, NULL, NULL, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, '[]', NULL, '{}', ?15, ?16, ?17, ?18,
-            'charge_automatically', 1, NULL)",
+            'charge_automatically', 1, NULL, ?19)",
     )
     .bind(&id)
     .bind(account_id)
@@ -333,6 +333,7 @@ pub async fn raise_subscription_invoice(
     .bind(billing_reason)
     .bind(period_start)
     .bind(period_end)
+    .bind(&subscription.test_clock)
     .execute(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
@@ -344,38 +345,54 @@ pub async fn raise_subscription_invoice(
         .map_err(ApiError::internal)?;
     let data = invoice.to_json(base_url);
     let mut event_ids = vec![
-        events::emit(
+        events::emit_at(
             tx,
             account_id,
             is_connected,
             "invoice.created",
             data.clone(),
+            created_at,
         )
         .await
         .map_err(ApiError::internal)?,
     ];
     if paid {
         event_ids.push(
-            events::emit(
+            events::emit_at(
                 tx,
                 account_id,
                 is_connected,
                 "invoice.payment_succeeded",
                 data.clone(),
+                created_at,
             )
             .await
             .map_err(ApiError::internal)?,
         );
         event_ids.push(
-            events::emit(tx, account_id, is_connected, "invoice.paid", data)
-                .await
-                .map_err(ApiError::internal)?,
+            events::emit_at(
+                tx,
+                account_id,
+                is_connected,
+                "invoice.paid",
+                data,
+                created_at,
+            )
+            .await
+            .map_err(ApiError::internal)?,
         );
     } else {
         event_ids.push(
-            events::emit(tx, account_id, is_connected, "invoice.payment_failed", data)
-                .await
-                .map_err(ApiError::internal)?,
+            events::emit_at(
+                tx,
+                account_id,
+                is_connected,
+                "invoice.payment_failed",
+                data,
+                created_at,
+            )
+            .await
+            .map_err(ApiError::internal)?,
         );
     }
     Ok((invoice, event_ids))
@@ -393,6 +410,290 @@ pub async fn open_subscription_invoice(
     .bind(subscription_id)
     .fetch_optional(&mut *conn)
     .await
+}
+
+/// How far a subscription should advance.
+#[derive(Debug, Clone, Copy)]
+pub enum AdvanceRun {
+    /// Retry an open invoice, otherwise advance exactly one period.
+    OnePeriod,
+    /// Retry an open invoice, then advance every period ending at or before
+    /// `target`. Used by clock-wide advancement.
+    Through(i64),
+}
+
+/// Advance a subscription's periods, retrying an open invoice first.
+///
+/// `retry_at` stamps the open-invoice retry and the final status change.
+/// Renewal invoices are stamped with the boundary they cross. The returned
+/// invoice is the last one paid or raised, when any.
+#[allow(clippy::too_many_arguments)]
+pub async fn advance_subscription_periods(
+    tx: &mut Transaction<'_, Sqlite>,
+    subscription: &SubscriptionRow,
+    account_id: &str,
+    is_connected: bool,
+    run: AdvanceRun,
+    paid: bool,
+    retry_at: i64,
+    base_url: &str,
+    event_ids: &mut Vec<String>,
+) -> Result<Option<InvoiceRow>, ApiError> {
+    let mut current = subscription.clone();
+    let mut last_invoice: Option<InvoiceRow> = None;
+
+    // A failed collection is retried before any period is advanced.
+    if let Some(invoice) = open_subscription_invoice(tx, &current.id)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        let attempt = invoice.attempt_count + 1;
+        let status = if paid { "paid" } else { "open" };
+        sqlx::query(
+            "UPDATE invoices SET status = ?1, amount_paid = ?2, amount_remaining = ?3,
+                paid_at = ?4, attempt_count = ?5, updated = ?6 WHERE id = ?7",
+        )
+        .bind(status)
+        .bind(if paid { invoice.amount_due } else { 0 })
+        .bind(if paid { 0 } else { invoice.remaining() })
+        .bind(if paid { Some(retry_at) } else { None })
+        .bind(attempt)
+        .bind(retry_at)
+        .bind(&invoice.id)
+        .execute(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
+        let updated: InvoiceRow = sqlx::query_as("SELECT * FROM invoices WHERE id = ?1")
+            .bind(&invoice.id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(ApiError::internal)?;
+        let data = updated.to_json(base_url);
+        if paid {
+            event_ids.push(
+                events::emit_at(
+                    tx,
+                    account_id,
+                    is_connected,
+                    "invoice.payment_succeeded",
+                    data.clone(),
+                    retry_at,
+                )
+                .await
+                .map_err(ApiError::internal)?,
+            );
+            event_ids.push(
+                events::emit_at(tx, account_id, is_connected, "invoice.paid", data, retry_at)
+                    .await
+                    .map_err(ApiError::internal)?,
+            );
+        } else {
+            event_ids.push(
+                events::emit_at(
+                    tx,
+                    account_id,
+                    is_connected,
+                    "invoice.payment_failed",
+                    data,
+                    retry_at,
+                )
+                .await
+                .map_err(ApiError::internal)?,
+            );
+        }
+        current.status = if paid { "active" } else { "past_due" }.to_string();
+        sqlx::query("UPDATE subscriptions SET status = ?1 WHERE id = ?2")
+            .bind(&current.status)
+            .bind(&current.id)
+            .execute(&mut **tx)
+            .await
+            .map_err(ApiError::internal)?;
+        event_ids.push(
+            events::emit_at(
+                tx,
+                account_id,
+                is_connected,
+                "customer.subscription.updated",
+                current.to_json(),
+                retry_at,
+            )
+            .await
+            .map_err(ApiError::internal)?,
+        );
+        last_invoice = Some(updated);
+        if matches!(run, AdvanceRun::OnePeriod) || !paid {
+            return Ok(last_invoice);
+        }
+    }
+
+    let (interval, interval_count) = subscription_interval(&current);
+    let status = if paid { "active" } else { "past_due" };
+
+    match run {
+        AdvanceRun::OnePeriod => {
+            let now = retry_at;
+            let old_start = current.current_period_start.unwrap_or(now);
+            let old_end = current.current_period_end.unwrap_or(now);
+            let period_start = current.current_period_end.unwrap_or(now);
+            let period_end = advance_period(period_start, &interval, interval_count);
+            let items = with_period(&current.items, period_start, period_end);
+            sqlx::query(
+                "UPDATE subscriptions SET current_period_start = ?1, current_period_end = ?2,
+                    status = ?3, items = ?4 WHERE id = ?5",
+            )
+            .bind(period_start)
+            .bind(period_end)
+            .bind(status)
+            .bind(items)
+            .bind(&current.id)
+            .execute(&mut **tx)
+            .await
+            .map_err(ApiError::internal)?;
+            current = load_subscription(tx, &current.id).await?;
+            let (invoice, invoice_events) = raise_subscription_invoice(
+                tx,
+                &current,
+                account_id,
+                is_connected,
+                period_start,
+                period_end,
+                old_start,
+                old_end,
+                "subscription_cycle",
+                paid,
+                now,
+                base_url,
+            )
+            .await?;
+            event_ids.extend(invoice_events);
+            event_ids.push(
+                events::emit_at(
+                    tx,
+                    account_id,
+                    is_connected,
+                    "customer.subscription.updated",
+                    current.to_json(),
+                    now,
+                )
+                .await
+                .map_err(ApiError::internal)?,
+            );
+            last_invoice = Some(invoice);
+        }
+        AdvanceRun::Through(target) => {
+            // Each crossing renews the subscription for the next period.
+            for _ in 0..1_000 {
+                let Some(boundary) = current.current_period_end else {
+                    break;
+                };
+                if boundary > target {
+                    break;
+                }
+                if current.cancel_at_period_end != 0 {
+                    sqlx::query("UPDATE subscriptions SET status = 'canceled' WHERE id = ?1")
+                        .bind(&current.id)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(ApiError::internal)?;
+                    current = load_subscription(tx, &current.id).await?;
+                    event_ids.push(
+                        events::emit_at(
+                            tx,
+                            account_id,
+                            is_connected,
+                            "customer.subscription.deleted",
+                            current.to_json(),
+                            boundary,
+                        )
+                        .await
+                        .map_err(ApiError::internal)?,
+                    );
+                    break;
+                }
+                let old_start = current.current_period_start.unwrap_or(boundary);
+                let old_end = boundary;
+                let period_start = boundary;
+                let period_end = advance_period(boundary, &interval, interval_count);
+                let items = with_period(&current.items, period_start, period_end);
+                sqlx::query(
+                    "UPDATE subscriptions SET current_period_start = ?1, current_period_end = ?2,
+                        status = ?3, items = ?4 WHERE id = ?5",
+                )
+                .bind(period_start)
+                .bind(period_end)
+                .bind(status)
+                .bind(items)
+                .bind(&current.id)
+                .execute(&mut **tx)
+                .await
+                .map_err(ApiError::internal)?;
+                current = load_subscription(tx, &current.id).await?;
+                let (invoice, invoice_events) = raise_subscription_invoice(
+                    tx,
+                    &current,
+                    account_id,
+                    is_connected,
+                    period_start,
+                    period_end,
+                    old_start,
+                    old_end,
+                    "subscription_cycle",
+                    paid,
+                    old_end,
+                    base_url,
+                )
+                .await?;
+                event_ids.extend(invoice_events);
+                event_ids.push(
+                    events::emit_at(
+                        tx,
+                        account_id,
+                        is_connected,
+                        "customer.subscription.updated",
+                        current.to_json(),
+                        old_end,
+                    )
+                    .await
+                    .map_err(ApiError::internal)?,
+                );
+                last_invoice = Some(invoice);
+            }
+        }
+    }
+
+    Ok(last_invoice)
+}
+
+/// Reload a subscription inside the caller's transaction.
+async fn load_subscription(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+) -> Result<SubscriptionRow, ApiError> {
+    sqlx::query_as("SELECT * FROM subscriptions WHERE id = ?1")
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(ApiError::internal)
+}
+
+/// Copy a subscription's items with new period bounds.
+fn with_period(items: &str, period_start: i64, period_end: i64) -> String {
+    match parse_json(&Some(items.to_string())) {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|mut item| {
+                    if let Value::Object(map) = &mut item {
+                        map.insert("current_period_start".into(), json!(period_start));
+                        map.insert("current_period_end".into(), json!(period_end));
+                    }
+                    item
+                })
+                .collect(),
+        )
+        .to_string(),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]

@@ -7,14 +7,12 @@ use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
 use crate::AppState;
-use crate::api::billing::{
-    advance_period, open_subscription_invoice, raise_subscription_invoice, subscription_interval,
-};
+use crate::api::billing::{AdvanceRun, advance_subscription_periods};
 use crate::api::ok;
 use crate::db;
 use crate::error::ApiError;
 use crate::models::{
-    AccountRow, DeliveryRow, EventDestinationRow, PaymentIntentRow, SubscriptionRow, parse_json,
+    AccountRow, DeliveryRow, EventDestinationRow, PaymentIntentRow, SubscriptionRow,
 };
 use crate::seed;
 use crate::time;
@@ -330,152 +328,39 @@ pub async fn advance_subscription(
         .await
         .map_err(ApiError::internal)?;
     let is_connected = is_main == 0;
-    let now = time::now_epoch();
+    // A clock subscription runs on simulated time, so its retry and renewal
+    // stamps follow the clock rather than wall-clock time.
+    let now = match &subscription.test_clock {
+        Some(clock_id) => {
+            let frozen: Option<i64> = sqlx::query_scalar(
+                "SELECT frozen_time FROM test_clocks WHERE id = ?1 AND account_id = ?2",
+            )
+            .bind(clock_id)
+            .bind(&account_id)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+            frozen.unwrap_or_else(time::now_epoch)
+        }
+        None => time::now_epoch(),
+    };
 
     let mut event_ids = Vec::new();
     let invoice = {
         let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
-        let open = open_subscription_invoice(&mut tx, &id)
-            .await
-            .map_err(ApiError::internal)?;
-
-        let invoice = if let Some(invoice) = open {
-            // Retry the invoice raised by a previous failed collection.
-            let attempt = invoice.attempt_count + 1;
-            let status = if paid { "paid" } else { "open" };
-            sqlx::query(
-                "UPDATE invoices SET status = ?1, amount_paid = ?2, amount_remaining = ?3,
-                    paid_at = ?4, attempt_count = ?5, updated = ?6 WHERE id = ?7",
-            )
-            .bind(status)
-            .bind(if paid { invoice.amount_due } else { 0 })
-            .bind(if paid { 0 } else { invoice.remaining() })
-            .bind(if paid { Some(now) } else { None })
-            .bind(attempt)
-            .bind(now)
-            .bind(&invoice.id)
-            .execute(&mut *tx)
-            .await
-            .map_err(ApiError::internal)?;
-            let updated: crate::models::InvoiceRow =
-                sqlx::query_as("SELECT * FROM invoices WHERE id = ?1")
-                    .bind(&invoice.id)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(ApiError::internal)?;
-            let data = updated.to_json(&st.config.base_url());
-            if paid {
-                event_ids.push(
-                    crate::events::emit(
-                        &mut tx,
-                        &account_id,
-                        is_connected,
-                        "invoice.payment_succeeded",
-                        data.clone(),
-                    )
-                    .await
-                    .map_err(ApiError::internal)?,
-                );
-                event_ids.push(
-                    crate::events::emit(&mut tx, &account_id, is_connected, "invoice.paid", data)
-                        .await
-                        .map_err(ApiError::internal)?,
-                );
-            } else {
-                event_ids.push(
-                    crate::events::emit(
-                        &mut tx,
-                        &account_id,
-                        is_connected,
-                        "invoice.payment_failed",
-                        data,
-                    )
-                    .await
-                    .map_err(ApiError::internal)?,
-                );
-            }
-            sqlx::query("UPDATE subscriptions SET status = ?1 WHERE id = ?2")
-                .bind(if paid { "active" } else { "past_due" })
-                .bind(&id)
-                .execute(&mut *tx)
-                .await
-                .map_err(ApiError::internal)?;
-            updated
-        } else {
-            // End the period and raise its renewal invoice.
-            let old_start = subscription.current_period_start.unwrap_or(now);
-            let old_end = subscription.current_period_end.unwrap_or(now);
-            let period_start = subscription.current_period_end.unwrap_or(now);
-            let (interval, interval_count) = subscription_interval(&subscription);
-            let period_end = advance_period(period_start, &interval, interval_count);
-            let items = parse_json(&Some(subscription.items.clone()));
-            let items = match items {
-                Value::Array(items) => Value::Array(
-                    items
-                        .into_iter()
-                        .map(|mut item| {
-                            if let Value::Object(map) = &mut item {
-                                map.insert("current_period_start".into(), json!(period_start));
-                                map.insert("current_period_end".into(), json!(period_end));
-                            }
-                            item
-                        })
-                        .collect(),
-                ),
-                other => other,
-            };
-            sqlx::query(
-                "UPDATE subscriptions SET current_period_start = ?1, current_period_end = ?2,
-                    status = ?3, items = ?4 WHERE id = ?5",
-            )
-            .bind(period_start)
-            .bind(period_end)
-            .bind(if paid { "active" } else { "past_due" })
-            .bind(items.to_string())
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
-            .map_err(ApiError::internal)?;
-            let updated: SubscriptionRow =
-                sqlx::query_as("SELECT * FROM subscriptions WHERE id = ?1")
-                    .bind(&id)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(ApiError::internal)?;
-            let (invoice, invoice_events) = raise_subscription_invoice(
-                &mut tx,
-                &updated,
-                &account_id,
-                is_connected,
-                period_start,
-                period_end,
-                old_start,
-                old_end,
-                "subscription_cycle",
-                paid,
-                &st.config.base_url(),
-            )
-            .await?;
-            event_ids.extend(invoice_events);
-            invoice
-        };
-
-        let updated: SubscriptionRow = sqlx::query_as("SELECT * FROM subscriptions WHERE id = ?1")
-            .bind(&id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(ApiError::internal)?;
-        event_ids.push(
-            crate::events::emit(
-                &mut tx,
-                &account_id,
-                is_connected,
-                "customer.subscription.updated",
-                updated.to_json(),
-            )
-            .await
-            .map_err(ApiError::internal)?,
-        );
+        let invoice = advance_subscription_periods(
+            &mut tx,
+            &subscription,
+            &account_id,
+            is_connected,
+            AdvanceRun::OnePeriod,
+            paid,
+            now,
+            &st.config.base_url(),
+            &mut event_ids,
+        )
+        .await?
+        .ok_or_else(|| ApiError::internal("advance raised no invoice"))?;
         tx.commit().await.map_err(ApiError::internal)?;
         invoice
     };

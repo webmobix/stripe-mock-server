@@ -37,6 +37,11 @@ pub fn tax_id() -> String {
     id("txi_")
 }
 
+/// Test clock identifier.
+pub fn test_clock_id() -> String {
+    id("clock_")
+}
+
 pub fn invoice_id() -> String {
     id("in_")
 }
@@ -150,6 +155,7 @@ mod tests {
         assert!(price_id().starts_with("price_"));
         assert!(customer_id().starts_with("cus_"));
         assert!(tax_id().starts_with("txi_"));
+        assert!(test_clock_id().starts_with("clock_"));
         assert!(invoice_id().starts_with("in_"));
         assert!(tax_rate_id().starts_with("txr_"));
         assert!(subscription_id().starts_with("sub_"));

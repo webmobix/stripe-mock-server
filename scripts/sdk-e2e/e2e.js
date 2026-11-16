@@ -115,6 +115,65 @@ const postForm = (url, params) =>
   await stripe.subscriptions.create({ customer: mainCustomer.id, items: [{ price: mainPrice.id }] });
   console.log('main subscription created');
 
+  // --- test clock: frozen customer, subscription, clock-wide renewal ------
+  const clockStart = 1_600_000_000;
+  const clock = await stripe.testHelpers.testClocks.create({
+    frozen_time: clockStart,
+    name: 'SDK clock',
+  });
+  if (!clock.id.startsWith('clock_')) throw new Error('bad test clock id');
+  if (clock.status !== 'ready') throw new Error('test clock not ready');
+
+  const clockCustomer = await stripe.customers.create({
+    email: 'clock@example.com',
+    test_clock: clock.id,
+  });
+  if (clockCustomer.test_clock !== clock.id) throw new Error('customer missing test clock');
+  if (clockCustomer.created !== clockStart) throw new Error('customer not stamped with frozen time');
+
+  const clockSubscription = await stripe.subscriptions.create({
+    customer: clockCustomer.id,
+    items: [{ price: mainPrice.id }],
+  });
+  if (clockSubscription.test_clock !== clock.id) throw new Error('subscription missing test clock');
+  if (clockSubscription.created !== clockStart) {
+    throw new Error('subscription not stamped with frozen time');
+  }
+  if (clockSubscription.current_period_end !== clockStart + 30 * 24 * 60 * 60) {
+    throw new Error('clock subscription period does not follow the price interval');
+  }
+
+  const clockTarget = clockStart + 30 * 24 * 60 * 60;
+  const advancing = await stripe.testHelpers.testClocks.advance(clock.id, {
+    frozen_time: clockTarget,
+  });
+  if (advancing.status !== 'advancing') throw new Error('advance did not report advancing');
+  if (advancing.status_details.advancing.target_frozen_time !== clockTarget) {
+    throw new Error('advance target missing');
+  }
+
+  const readyClock = await stripe.testHelpers.testClocks.retrieve(clock.id);
+  if (readyClock.status !== 'ready' || readyClock.frozen_time !== clockTarget) {
+    throw new Error('test clock did not become ready');
+  }
+
+  const clockInvoices = await stripe.invoices.list({ subscription: clockSubscription.id });
+  const clockRenewal = clockInvoices.data.find((invoice) => invoice.billing_reason === 'subscription_cycle');
+  if (!clockRenewal) throw new Error('clock renewal invoice missing');
+  if (clockRenewal.status !== 'paid') throw new Error('clock renewal invoice not paid');
+
+  const renewedSubscription = await stripe.subscriptions.retrieve(clockSubscription.id);
+  if (renewedSubscription.current_period_start !== clockTarget) {
+    throw new Error('clock subscription was not renewed');
+  }
+  console.log(
+    'test clock renewal',
+    clock.id,
+    readyClock.frozen_time,
+    clockRenewal.id,
+    renewedSubscription.status,
+  );
+
   // --- lookup keys, expansion, subscription updates, portal, totals -------
   const lookupProduct = await stripe.products.create({ name: 'E2E Lookup Plan' });
   const lookupPrice = await stripe.prices.create({
@@ -564,7 +623,7 @@ const postForm = (url, params) =>
   await fetch(`${MOCK}/internal/deliveries/flush`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ timeout_ms: 8000 }),
+    body: JSON.stringify({ timeout_ms: 20000 }),
   });
 
   const connectedEvent = connectedReceiver.received.find((r) => r.type === 'checkout.session.completed');

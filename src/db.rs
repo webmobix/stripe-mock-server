@@ -77,6 +77,16 @@ CREATE TABLE IF NOT EXISTS prices (
     meter_id TEXT
 );
 
+CREATE TABLE IF NOT EXISTS test_clocks (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    name TEXT,
+    frozen_time INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ready',
+    created INTEGER NOT NULL,
+    deletes_after INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS customers (
     id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL,
@@ -86,7 +96,8 @@ CREATE TABLE IF NOT EXISTS customers (
     created INTEGER NOT NULL,
     tax_ids TEXT,
     metadata TEXT,
-    invoice_settings TEXT
+    invoice_settings TEXT,
+    test_clock TEXT
 );
 
 CREATE TABLE IF NOT EXISTS payment_methods (
@@ -128,7 +139,8 @@ CREATE TABLE IF NOT EXISTS invoices (
     period_end INTEGER,
     collection_method TEXT NOT NULL DEFAULT 'send_invoice',
     attempt_count INTEGER NOT NULL DEFAULT 0,
-    payment_intent TEXT
+    payment_intent TEXT,
+    test_clock TEXT
 );
 
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -142,7 +154,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     current_period_end INTEGER,
     cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
     items TEXT NOT NULL,
-    metadata TEXT
+    metadata TEXT,
+    test_clock TEXT
 );
 
 CREATE TABLE IF NOT EXISTS checkout_sessions (
@@ -436,6 +449,10 @@ async fn migrate_legacy_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     }
     // Customer default payment method and invoice/subscription billing columns.
     add_column_if_missing(pool, "customers", "invoice_settings", "TEXT").await?;
+    // Test clock associations were added after the initial schema.
+    for table in ["customers", "subscriptions", "invoices"] {
+        add_column_if_missing(pool, table, "test_clock", "TEXT").await?;
+    }
     for (column, decl) in [
         ("subscription", "TEXT"),
         ("billing_reason", "TEXT"),
@@ -497,6 +514,7 @@ pub async fn reset_state(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "meter_events",
         "billing_meters",
         "idempotency_keys",
+        "test_clocks",
         "customers",
         "prices",
         "products",
@@ -610,6 +628,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clocks_table_and_associations_exist() {
+        let pool = connect_in_memory().await.unwrap();
+        migrate(&pool).await.unwrap();
+        for column in ["customers", "subscriptions", "invoices"] {
+            assert!(
+                has_column(&pool, column, "test_clock").await.unwrap(),
+                "{column}.test_clock was not added"
+            );
+        }
+        sqlx::query(
+            "INSERT INTO test_clocks (id, account_id, name, frozen_time, status, created, deletes_after) \
+             VALUES ('clock_1', 'acct_1', 'Annual renewal', 1577836800, 'ready', 0, 2592000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let frozen: i64 =
+            sqlx::query_scalar("SELECT frozen_time FROM test_clocks WHERE id = 'clock_1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(frozen, 1_577_836_800);
+    }
+
+    #[tokio::test]
+    async fn legacy_tables_gain_test_clock_columns() {
+        let pool = connect_in_memory().await.unwrap();
+        // A pre-existing database with the three tables but without clocks.
+        sqlx::query(
+            "CREATE TABLE customers (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, email TEXT, \
+             name TEXT, currency TEXT, created INTEGER NOT NULL, tax_ids TEXT, metadata TEXT, \
+             invoice_settings TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE subscriptions (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, \
+             customer TEXT, customer_account TEXT, status TEXT NOT NULL, created INTEGER NOT NULL, \
+             current_period_start INTEGER, current_period_end INTEGER, \
+             cancel_at_period_end INTEGER NOT NULL DEFAULT 0, items TEXT NOT NULL, metadata TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE invoices (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, \
+             customer TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', \
+             currency TEXT NOT NULL DEFAULT 'usd', created INTEGER NOT NULL, \
+             updated INTEGER NOT NULL, lines TEXT NOT NULL DEFAULT '[]', \
+             customer_tax_ids TEXT NOT NULL DEFAULT '[]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate(&pool).await.unwrap();
+
+        for table in ["customers", "subscriptions", "invoices"] {
+            assert!(
+                has_column(&pool, table, "test_clock").await.unwrap(),
+                "{table}.test_clock was not migrated"
+            );
+        }
+        // The new table is usable after the migration.
+        sqlx::query(
+            "INSERT INTO test_clocks (id, account_id, frozen_time, status, created, deletes_after) \
+             VALUES ('clock_1', 'acct_1', 0, 'ready', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn reset_state_clears_new_tables() {
         let pool = connect_in_memory().await.unwrap();
         migrate(&pool).await.unwrap();
@@ -634,10 +727,22 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO test_clocks (id, account_id, frozen_time, status, created, deletes_after) \
+             VALUES ('clock_1', 'acct_1', 0, 'ready', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         reset_state(&pool).await.unwrap();
 
-        for table in ["coupons", "tax_rates", "billing_portal_sessions"] {
+        for table in [
+            "coupons",
+            "tax_rates",
+            "billing_portal_sessions",
+            "test_clocks",
+        ] {
             let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
                 .fetch_one(&pool)
                 .await

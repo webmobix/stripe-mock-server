@@ -3,6 +3,7 @@ pub mod expand;
 pub mod invoicing;
 pub mod meters;
 pub mod payment_methods;
+pub mod test_clocks;
 pub mod v1;
 pub mod v2;
 
